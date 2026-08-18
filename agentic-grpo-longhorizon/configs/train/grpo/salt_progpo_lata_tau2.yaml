@@ -73,7 +73,6 @@ actor_rollout_ref:
     fsdp_config:
       optimizer_offload: true
       param_offload: true
-      use_fused_kernels: true
       model_dtype: bf16
     model:
       path: experiments/sft_lora_merged
@@ -104,7 +103,9 @@ trainer:
   total_epochs: 50
   total_training_steps: 300
   save_freq: 50
-  test_freq: 50
+  # Keep the official tau2 test split held out until the fixed budget finishes.
+  val_before_train: false
+  test_freq: -1
   default_local_dir: experiments/salt_progpo_lata_tau2/checkpoints
   logger: [console, swanlab]
   project_name: agentic-grpo-longhorizon
