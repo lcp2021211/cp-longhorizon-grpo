@@ -6,27 +6,27 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 > **Solving GRPO Training Collapse in Long-Horizon Multi-Tool Agents**  
-> The original PRM-Lite + LATA ablations are preserved, and the active training path now adds **ProGPO + LATA** on the current **tau2-bench Gym API**.
+> The original ablations are preserved, and the active training path now combines **SALT + ProGPO + LATA** on the current **tau2-bench Gym API**.
 
 ---
 
-## 🆕 ProGPO + LATA / tau2-bench
+## 🆕 SALT + ProGPO + LATA / tau2-bench
 
 The new path targets the early-training **all-fail deadlock** without making a dense process reward permanently part of the objective:
 
 1. Every tau2 trajectory records exact first-visit observation coverage, `P = novel_observations / actions`.
-2. If a rollout group contains outcome contrast, the estimator is unchanged GRPO.
+2. If a rollout group contains outcome contrast, SALT merges identical transition edges and assigns step-level advantages from the original GRPO outcomes.
 3. Only when the whole group fails does ProGPO use normalized progress as a fallback; progress-degenerate groups still receive zero advantage.
-4. LATA then transmits that trajectory advantage through the long response with early-token weighting and `1/sqrt(L)` normalization.
+4. LATA then transmits the SALT step advantage or ProGPO trajectory fallback with real assistant-turn weighting and `1/sqrt(L)` normalization.
 
 The adapter uses tau2's official `AgentGymEnv`, `train`/`test` task splits, runtime domain policy, initial simulated user message, current tool schemas, and terminal `done` action. The historical numbers below belong to the repository's original 50-task tau-bench experiments; **no new tau2 training result is claimed until a full GPU run is completed**.
 
 ```bash
-# Build official tau2 airline train/test parquet and launch ProGPO + LATA.
-bash agentic-grpo-longhorizon/scripts/train/grpo/run_progpo_lata_tau2.sh
+# Build official tau2 airline train/test parquet and launch the full method.
+bash agentic-grpo-longhorizon/scripts/train/grpo/run_salt_progpo_lata_tau2.sh
 ```
 
-See [`docs/progpo_lata_tau2.md`](agentic-grpo-longhorizon/docs/progpo_lata_tau2.md) for the algorithm, data flow, diagnostics, and reproduction notes.
+See [`docs/salt_progpo_lata_tau2.md`](agentic-grpo-longhorizon/docs/salt_progpo_lata_tau2.md) for the algorithm, data flow, diagnostics, and reproduction notes. The ProGPO + LATA path remains available as an ablation.
 
 ---
 
@@ -216,8 +216,8 @@ pip install -e ./verl
 ### 2. Train a Model
 
 ```bash
-# Recommended: ProGPO + LATA on current tau2-bench
-bash agentic-grpo-longhorizon/scripts/train/grpo/run_progpo_lata_tau2.sh
+# Recommended: SALT + ProGPO + LATA on current tau2-bench
+bash agentic-grpo-longhorizon/scripts/train/grpo/run_salt_progpo_lata_tau2.sh
 
 # Example: Joint (PRM-Lite + LATA)
 cd scripts/train/grpo
@@ -244,6 +244,7 @@ bash eval_exp4_prm_lite_lata.sh
 
 | 📄 Document | 📝 Content |
 |----------|---------|
+| [`agentic-grpo-longhorizon/docs/salt_progpo_lata_tau2.md`](agentic-grpo-longhorizon/docs/salt_progpo_lata_tau2.md) | SALT + ProGPO + LATA implementation and current tau2-bench guide |
 | [`agentic-grpo-longhorizon/docs/progpo_lata_tau2.md`](agentic-grpo-longhorizon/docs/progpo_lata_tau2.md) | ProGPO + LATA and current tau2-bench implementation guide |
 | [`docs/ablation/ablation_diagnosis_report.md`](docs/ablation/ablation_diagnosis_report.md) | **Main report**: training curves, eval data, mechanism analysis, hypothesis validation |
 | [`docs/ablation/ablation_plan.md`](docs/ablation/ablation_plan.md) | Experiment design manual: code implementation, PRM-Lite rule set, hacking risk analysis |

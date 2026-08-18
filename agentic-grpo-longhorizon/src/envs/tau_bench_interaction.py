@@ -495,6 +495,8 @@ class TauBenchInteraction(BaseInteraction):
                     "total_reward": state["total_reward"],
                     "num_turns": state["num_user_turns"] + state["num_tool_calls"],
                     "task_id": state["task_id"],
+                    "salt_observation": "",
+                    "salt_mergeable": False,
                 },
             )
 
@@ -519,6 +521,8 @@ class TauBenchInteraction(BaseInteraction):
                     "error": "respond_exception",
                     "reason": f"{type(e).__name__}: {e}",
                     "task_id": state["task_id"],
+                    "salt_observation": "",
+                    "salt_mergeable": False,
                 },
             )
 
@@ -549,6 +553,10 @@ class TauBenchInteraction(BaseInteraction):
                     "reason": "done" if is_done else "max_turns",
                     "reward_mode": self.reward_mode,
                     "transferred_to_human": state.get("transferred_to_human", False),
+                    # ToolAgentLoop intentionally does not put a terminal user
+                    # message back into the prompt, but SALT still needs the
+                    # environment's resulting state for transition matching.
+                    "salt_observation": step_res.observation,
                 },
             )
 

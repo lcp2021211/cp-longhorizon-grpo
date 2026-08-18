@@ -21,6 +21,13 @@ from typing import Any, Optional
 from uuid import uuid4
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
+from verl.experimental.agent_loop.salt_trace import (
+    build_root_key,
+    build_text_action_key,
+    build_text_observation_key,
+    build_tool_action_key,
+    build_tool_observation_key,
+)
 from verl.experimental.agent_loop.tool_parser import FunctionCall, ToolParser
 from verl.experimental.agent_loop.utils import add_generation_prompt_for_gpt_oss, format_gpt_oss_tool_response_manually
 from verl.interactions.base import BaseInteraction
@@ -74,6 +81,11 @@ class AgentData:
         self.turn_scores: list[float] = []
         self.tool_rewards: list[float] = []
         self.reasoning_tokens_per_turn: list[int] = []
+        # SALT trace. Spans are half-open offsets into the final response
+        # buffer and cover exactly one assistant generation.
+        self.salt_root_key: str = build_root_key(messages)
+        self.salt_steps: list[dict[str, Any]] = []
+        self.pending_salt_step: Optional[dict[str, Any]] = None
         self.total_tool_calls: int = 0
         self.total_errors: int = 0
         self.user_turns = 0
@@ -176,6 +188,12 @@ class ToolAgentLoop(AgentLoopBase):
                 logger.error(f"Invalid state: {state}")
                 state = AgentState.TERMINATED
 
+        # Generic ToolAgentLoop deployments without an Interaction may stop
+        # after a plain assistant message. Preserve the span as a safe,
+        # non-mergeable step instead of silently dropping generated tokens.
+        if agent_data.pending_salt_step is not None:
+            self._finalize_salt_step(agent_data, termination="state_machine_exit")
+
         # Calculate final reward from interaction if available
         reward_score = None
         conditional_prm_info = {}
@@ -228,6 +246,8 @@ class ToolAgentLoop(AgentLoopBase):
             "reasoning_tokens_per_turn": agent_data.reasoning_tokens_per_turn,
             "total_tool_calls": agent_data.total_tool_calls,
             "total_errors": agent_data.total_errors,
+            "salt_root_key": agent_data.salt_root_key,
+            "salt_steps": agent_data.salt_steps,
         })
         if conditional_prm_info:
             output.extra_fields.update(conditional_prm_info)
@@ -275,19 +295,31 @@ class ToolAgentLoop(AgentLoopBase):
                 image_data=agent_data.image_data,
             )
 
+        token_start = len(agent_data.response_mask)
         agent_data.assistant_turns += 1
         agent_data.response_ids = output.token_ids
         agent_data.prompt_ids += agent_data.response_ids
         agent_data.response_mask += [1] * len(agent_data.response_ids)
+        agent_data.pending_salt_step = {
+            "token_start": token_start,
+            "token_end": len(agent_data.response_mask),
+            "action_type": "incomplete",
+            "action_key": None,
+            "observation_key": None,
+            "mergeable": False,
+        }
         if output.log_probs:
             agent_data.response_logprobs += output.log_probs
 
         # Check termination conditions
         if not ignore_termination and len(agent_data.response_mask) >= self.response_length:
+            self._finalize_salt_step(agent_data, termination="max_response_length")
             return AgentState.TERMINATED
         if self.max_assistant_turns and agent_data.assistant_turns >= self.max_assistant_turns:
+            self._finalize_salt_step(agent_data, termination="max_assistant_turns")
             return AgentState.TERMINATED
         if self.max_user_turns and agent_data.user_turns >= self.max_user_turns:
+            self._finalize_salt_step(agent_data, termination="max_user_turns")
             return AgentState.TERMINATED
 
         # Extract tool calls
@@ -305,6 +337,22 @@ class ToolAgentLoop(AgentLoopBase):
             # [W5 PRM-Lite] 记录当前 turn 的 assistant content，供 tool.execute 读取
             if agent_data.tool_calls:
                 record_assistant_content(assistant_message)
+
+        pending_step = agent_data.pending_salt_step
+        if pending_step is not None:
+            if agent_data.tool_calls:
+                selected_calls = agent_data.tool_calls[: self.max_parallel_calls]
+                pending_step.update(
+                    action_type="tool",
+                    action_key=build_tool_action_key(selected_calls),
+                    mergeable=bool(selected_calls),
+                )
+            elif self.interaction_config_file:
+                pending_step.update(
+                    action_type="respond",
+                    action_key=build_text_action_key(assistant_message),
+                    mergeable=True,
+                )
 
         # Determine next state
         if agent_data.tool_calls:
@@ -385,6 +433,13 @@ class ToolAgentLoop(AgentLoopBase):
             if tool_reward is not None:
                 agent_data.tool_rewards.append(tool_reward)
 
+        self._finalize_salt_step(
+            agent_data,
+            observation_key=build_tool_observation_key(
+                tool_response for tool_response, _, _ in responses
+            ),
+        )
+
         agent_data.messages.extend(add_messages)
         if terminate_sequence:
             return AgentState.TERMINATED
@@ -454,6 +509,17 @@ class ToolAgentLoop(AgentLoopBase):
         )
         agent_data.user_turns += 1
 
+        salt_observation = interaction_responses
+        salt_mergeable = True
+        if isinstance(metrics, dict):
+            salt_observation = metrics.get("salt_observation", salt_observation)
+            salt_mergeable = bool(metrics.get("salt_mergeable", True))
+        self._finalize_salt_step(
+            agent_data,
+            observation_key=build_text_observation_key(salt_observation),
+            mergeable=salt_mergeable,
+        )
+
         add_messages: list[dict[str, Any]] = [{"role": "user", "content": interaction_responses}]
         agent_data.messages.extend(add_messages)
 
@@ -492,6 +558,29 @@ class ToolAgentLoop(AgentLoopBase):
             return AgentState.TERMINATED
         else:
             return AgentState.GENERATING
+
+    @staticmethod
+    def _finalize_salt_step(
+        agent_data: AgentData,
+        *,
+        observation_key: Optional[str] = None,
+        mergeable: Optional[bool] = None,
+        termination: Optional[str] = None,
+    ) -> None:
+        """Close one assistant action without ever dropping its token span."""
+        step = agent_data.pending_salt_step
+        if step is None:
+            return
+        if observation_key is not None:
+            step["observation_key"] = observation_key
+        if mergeable is not None:
+            step["mergeable"] = bool(step["mergeable"] and mergeable)
+        if step.get("action_key") is None or step.get("observation_key") is None:
+            step["mergeable"] = False
+        if termination is not None:
+            step["termination"] = termination
+        agent_data.salt_steps.append(step)
+        agent_data.pending_salt_step = None
 
     async def _call_tool(
         self, tool_call: FunctionCall, tools_kwargs: dict[str, Any]

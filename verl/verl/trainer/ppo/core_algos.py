@@ -588,6 +588,401 @@ def compute_progpo_group_scores(
     return scalar_advantages, diagnostics
 
 
+def _freeze_salt_key(value: Any) -> Any:
+    """Convert JSON-like rollout metadata into a deterministic hashable key."""
+    if isinstance(value, dict):
+        return tuple(
+            (str(key), _freeze_salt_key(item))
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        )
+    if isinstance(value, (list, tuple, np.ndarray)):
+        return tuple(_freeze_salt_key(item) for item in value)
+    if isinstance(value, np.generic):
+        return value.item()
+    try:
+        hash(value)
+    except TypeError:
+        return repr(value)
+    return value
+
+
+def _salt_records(value: Any) -> list[Any] | None:
+    if value is None:
+        return None
+    if isinstance(value, np.ndarray):
+        value = value.tolist()
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return None
+
+
+def compute_salt_step_scores(
+    trajectory_advantages: torch.Tensor,
+    index: np.ndarray,
+    salt_steps: np.ndarray | list[Any],
+    *,
+    root_keys: np.ndarray | list[Any] | None = None,
+    outcome_rewards: torch.Tensor | np.ndarray,
+    response_mask: torch.Tensor | None = None,
+    history_length: int = 3,
+    tau_reward: float = 1e-3,
+) -> tuple[list[list[torch.Tensor]], np.ndarray, dict[str, Any]]:
+    """Refine mixed-outcome trajectory advantages with the SALT graph.
+
+    This implements Algorithm 1 from SALT exactly: the transition key is
+    ``(s_prev, action, s_next)`` and every occurrence of a repeated key receives
+    the arithmetic mean of its source trajectory advantages.  Unique edges
+    retain their original trajectory advantage.  ProGPO all-fail groups are
+    deliberately ineligible because applying SALT to progress advantages would
+    be an unvalidated extension of the outcome-only method.
+    """
+    if history_length < 1:
+        raise ValueError("SALT history_length must be at least 1")
+    if trajectory_advantages.ndim != 1:
+        raise ValueError("SALT expects one scalar advantage per trajectory")
+    if len(trajectory_advantages) != len(index) or len(salt_steps) != len(index):
+        raise ValueError("SALT advantages, traces, and group index must align")
+
+    outcomes = torch.as_tensor(
+        outcome_rewards,
+        device=trajectory_advantages.device,
+        dtype=trajectory_advantages.dtype,
+    )
+    if outcomes.ndim != 1 or len(outcomes) != len(index):
+        raise ValueError("SALT outcome rewards must align with trajectories")
+    if root_keys is not None and len(root_keys) != len(index):
+        raise ValueError("SALT root keys must align with trajectories")
+    if response_mask is not None and (
+        response_mask.ndim != 2 or response_mask.shape[0] != len(index)
+    ):
+        raise ValueError("SALT response mask must align with trajectories")
+
+    records_by_sample = [_salt_records(value) for value in salt_steps]
+    step_scores: list[list[torch.Tensor]] = []
+    for sample_idx, records in enumerate(records_by_sample):
+        step_scores.append(
+            [] if records is None else [trajectory_advantages[sample_idx] for _ in records]
+        )
+
+    positions_by_group: dict[Any, list[int]] = defaultdict(list)
+    for sample_idx, group_id in enumerate(index):
+        positions_by_group[group_id].append(sample_idx)
+
+    eligible_by_sample = np.zeros(len(index), dtype=bool)
+    invalid_key_steps = 0
+    unmergeable_steps = 0
+    graph_invalid_spans = 0
+    graph_overlapping_spans = 0
+    trace_missing_samples = 0
+    mergeable_occurrences = 0
+    merged_occurrences = 0
+    merged_transitions = 0
+    unique_transitions = 0
+    merged_tool_occurrences = 0
+    merged_text_occurrences = 0
+    eligible_groups = 0
+
+    with torch.no_grad():
+        for group_id, positions in positions_by_group.items():
+            group_outcomes = outcomes[positions]
+            outcome_spread = torch.max(group_outcomes) - torch.min(group_outcomes)
+            if outcome_spread.item() < tau_reward:
+                continue
+            eligible_groups += 1
+            eligible_by_sample[positions] = True
+
+            occurrence_map: dict[Any, list[tuple[int, int, str]]] = defaultdict(list)
+            for sample_idx in positions:
+                records = records_by_sample[sample_idx]
+                if records is None:
+                    trace_missing_samples += 1
+                    continue
+
+                root = (
+                    _freeze_salt_key(root_keys[sample_idx])
+                    if root_keys is not None
+                    else ("group_root", _freeze_salt_key(group_id))
+                )
+                history: list[tuple[Any, Any]] = []
+                span_coverage = (
+                    torch.zeros_like(response_mask[sample_idx], dtype=torch.bool)
+                    if response_mask is not None
+                    else None
+                )
+                for step_idx, record in enumerate(records):
+                    if not isinstance(record, dict):
+                        pair = (
+                            ("invalid_action", sample_idx, step_idx),
+                            ("invalid_observation", sample_idx, step_idx),
+                        )
+                        history.append(pair)
+                        invalid_key_steps += 1
+                        continue
+
+                    action = record.get("action_key")
+                    observation = record.get("observation_key")
+                    mergeable = bool(record.get("mergeable", True))
+                    valid_key = mergeable and action is not None and observation is not None
+                    if valid_key:
+                        action_key = _freeze_salt_key(action)
+                        observation_key = _freeze_salt_key(observation)
+                    else:
+                        action_key = ("unmergeable_action", sample_idx, step_idx)
+                        observation_key = ("unmergeable_observation", sample_idx, step_idx)
+                        if not mergeable:
+                            unmergeable_steps += 1
+                        else:
+                            invalid_key_steps += 1
+
+                    valid_span = True
+                    if response_mask is not None:
+                        start = record.get("token_start")
+                        end = record.get("token_end")
+                        valid_span = not (
+                            isinstance(start, bool)
+                            or isinstance(end, bool)
+                            or not isinstance(start, (int, np.integer))
+                            or not isinstance(end, (int, np.integer))
+                            or start < 0
+                            or end <= start
+                            or end > response_mask.shape[1]
+                        )
+                        if valid_span:
+                            start, end = int(start), int(end)
+                            valid_span = bool(
+                                torch.all(response_mask[sample_idx, start:end].bool()).item()
+                            )
+                        if not valid_span:
+                            graph_invalid_spans += 1
+                        elif bool(torch.any(span_coverage[start:end]).item()):
+                            graph_overlapping_spans += 1
+                            valid_span = False
+                        else:
+                            span_coverage[start:end] = True
+
+                    previous_state = (
+                        ("root", root)
+                        if not history
+                        else ("history", tuple(history[-history_length:]))
+                    )
+                    pair = (action_key, observation_key)
+                    history.append(pair)
+                    next_state = ("history", tuple(history[-history_length:]))
+                    if valid_key and valid_span:
+                        transition_key = (previous_state, action_key, next_state)
+                        action_type = str(record.get("action_type", "unknown"))
+                        occurrence_map[transition_key].append(
+                            (sample_idx, step_idx, action_type)
+                        )
+                        mergeable_occurrences += 1
+
+            for occurrences in occurrence_map.values():
+                if len(occurrences) == 1:
+                    unique_transitions += 1
+                    continue
+                merged_transitions += 1
+                merged_occurrences += len(occurrences)
+                mean_advantage = torch.stack(
+                    [trajectory_advantages[sample_idx] for sample_idx, _, _ in occurrences]
+                ).mean()
+                for sample_idx, step_idx, action_type in occurrences:
+                    step_scores[sample_idx][step_idx] = mean_advantage
+                    if action_type == "tool":
+                        merged_tool_occurrences += 1
+                    elif action_type == "respond":
+                        merged_text_occurrences += 1
+
+    num_groups = len(positions_by_group)
+    diagnostics = {
+        "salt/history_length": int(history_length),
+        "salt/eligible_group_rate": float(eligible_groups / max(num_groups, 1)),
+        "salt/num_eligible_groups": int(eligible_groups),
+        "salt/num_mergeable_occurrences": int(mergeable_occurrences),
+        "salt/num_merged_occurrences": int(merged_occurrences),
+        "salt/num_merged_transitions": int(merged_transitions),
+        "salt/num_unique_transitions": int(unique_transitions),
+        "salt/merge_rate": float(merged_occurrences / max(mergeable_occurrences, 1)),
+        "salt/merged_tool_occurrences": int(merged_tool_occurrences),
+        "salt/merged_text_occurrences": int(merged_text_occurrences),
+        "salt/invalid_key_steps": int(invalid_key_steps),
+        "salt/unmergeable_steps": int(unmergeable_steps),
+        "salt/graph_invalid_spans": int(graph_invalid_spans),
+        "salt/graph_overlapping_spans": int(graph_overlapping_spans),
+        "salt/trace_missing_samples": int(trace_missing_samples),
+    }
+    return step_scores, eligible_by_sample, diagnostics
+
+
+def _apply_salt_spans(
+    scalar_advantages: torch.Tensor,
+    step_scores: list[list[torch.Tensor]],
+    eligible_by_sample: np.ndarray,
+    salt_steps: np.ndarray | list[Any],
+    response_mask: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Broadcast SALT step scores onto their assistant-token spans fail-safely."""
+    response_length = response_mask.shape[1]
+    token_scalars = scalar_advantages.unsqueeze(-1).expand_as(response_mask).clone()
+    covered = torch.zeros_like(response_mask, dtype=torch.bool)
+    invalid_spans = 0
+    overlapping_spans = 0
+
+    with torch.no_grad():
+        for sample_idx in range(len(scalar_advantages)):
+            if not eligible_by_sample[sample_idx]:
+                continue
+            records = _salt_records(salt_steps[sample_idx])
+            if records is None:
+                continue
+            for step_idx, record in enumerate(records):
+                if not isinstance(record, dict) or step_idx >= len(step_scores[sample_idx]):
+                    invalid_spans += 1
+                    continue
+                start = record.get("token_start")
+                end = record.get("token_end")
+                if (
+                    isinstance(start, bool)
+                    or isinstance(end, bool)
+                    or not isinstance(start, (int, np.integer))
+                    or not isinstance(end, (int, np.integer))
+                    or start < 0
+                    or end <= start
+                    or end > response_length
+                ):
+                    invalid_spans += 1
+                    continue
+                start, end = int(start), int(end)
+                span_mask = response_mask[sample_idx, start:end].bool()
+                if not bool(torch.all(span_mask).item()):
+                    invalid_spans += 1
+                    continue
+                if bool(torch.any(covered[sample_idx, start:end]).item()):
+                    overlapping_spans += 1
+                    continue
+                token_scalars[sample_idx, start:end] = step_scores[sample_idx][step_idx]
+                covered[sample_idx, start:end] = True
+
+    eligible_tensor = torch.as_tensor(
+        eligible_by_sample, device=response_mask.device, dtype=torch.bool
+    ).unsqueeze(-1)
+    eligible_active = response_mask.bool() & eligible_tensor
+    uncovered = eligible_active & ~covered
+    eligible_token_count = int(eligible_active.sum().item())
+    diagnostics = {
+        "salt/invalid_spans": int(invalid_spans),
+        "salt/overlapping_spans": int(overlapping_spans),
+        "salt/uncovered_token_rate": float(
+            uncovered.sum().item() / max(eligible_token_count, 1)
+        ),
+    }
+    return token_scalars, diagnostics
+
+
+def compute_lata_turn_weights(
+    response_mask: torch.Tensor,
+    salt_steps: np.ndarray | list[Any],
+    *,
+    alpha: float = 1.05,
+    epsilon: float = 1e-6,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Compute LATA weights over real assistant turns, not response offsets.
+
+    Observation tokens can be arbitrarily long in a tool environment.  Using
+    their absolute response-buffer offsets would spuriously discount later
+    policy tokens.  Each valid assistant span therefore gets one turn weight,
+    and the weights are normalized so their mean over policy tokens is one.
+    Uncovered policy tokens receive a neutral raw weight of one.
+    """
+    if not math.isfinite(alpha) or alpha <= 0:
+        raise ValueError("LATA alpha must be finite and positive")
+    if response_mask.ndim != 2 or len(salt_steps) != response_mask.shape[0]:
+        raise ValueError("LATA traces and response mask must align")
+
+    batch_size, response_length = response_mask.shape
+    weights = torch.zeros_like(response_mask, dtype=torch.float32)
+    uncovered_tokens = 0
+    active_tokens = 0
+    metadata_fallback_samples = 0
+    invalid_spans = 0
+    overlapping_spans = 0
+
+    with torch.no_grad():
+        for sample_idx in range(batch_size):
+            active_mask = response_mask[sample_idx].bool()
+            active_count = int(active_mask.sum().item())
+            active_tokens += active_count
+            raw_weights = torch.ones(
+                response_length, device=response_mask.device, dtype=torch.float64
+            )
+            covered = torch.zeros(
+                response_length, device=response_mask.device, dtype=torch.bool
+            )
+            valid_spans: list[tuple[int, int]] = []
+            records = _salt_records(salt_steps[sample_idx])
+            if records is not None:
+                for record in records:
+                    if not isinstance(record, dict):
+                        invalid_spans += 1
+                        continue
+                    start = record.get("token_start")
+                    end = record.get("token_end")
+                    if (
+                        isinstance(start, bool)
+                        or isinstance(end, bool)
+                        or not isinstance(start, (int, np.integer))
+                        or not isinstance(end, (int, np.integer))
+                        or start < 0
+                        or end <= start
+                        or end > response_length
+                    ):
+                        invalid_spans += 1
+                        continue
+                    start, end = int(start), int(end)
+                    if not bool(torch.all(active_mask[start:end]).item()):
+                        invalid_spans += 1
+                        continue
+                    if bool(torch.any(covered[start:end]).item()):
+                        overlapping_spans += 1
+                        continue
+                    covered[start:end] = True
+                    valid_spans.append((start, end))
+
+            valid_spans.sort(key=lambda span: span[0])
+            if not valid_spans:
+                metadata_fallback_samples += 1
+            else:
+                num_turns = len(valid_spans)
+                for turn_idx, (start, end) in enumerate(valid_spans):
+                    raw_weights[start:end] = math.exp(
+                        (num_turns - 1 - turn_idx) * math.log(alpha)
+                    )
+
+            uncovered_tokens += int((active_mask & ~covered).sum().item())
+            weighted_sum = (raw_weights * active_mask.to(torch.float64)).sum().clamp(
+                min=epsilon
+            )
+            normalized = raw_weights * max(active_count, 1) / weighted_sum
+            weights[sample_idx] = (
+                normalized * active_mask.to(torch.float64)
+            ).to(torch.float32)
+
+    active_weight_values = weights[response_mask.bool()]
+    diagnostics = {
+        "lata/turn_alpha": float(alpha),
+        "lata/metadata_fallback_samples": int(metadata_fallback_samples),
+        "lata/invalid_spans": int(invalid_spans),
+        "lata/overlapping_spans": int(overlapping_spans),
+        "lata/uncovered_token_rate": float(uncovered_tokens / max(active_tokens, 1)),
+        "lata/max_token_weight": float(active_weight_values.max().item())
+        if len(active_weight_values)
+        else 0.0,
+        "lata/min_token_weight": float(active_weight_values.min().item())
+        if len(active_weight_values)
+        else 0.0,
+    }
+    return weights, diagnostics
+
+
 @register_adv_est("grpo_progpo_lata")
 def compute_grpo_progpo_lata_outcome_advantage(
     token_level_rewards: torch.Tensor,
@@ -664,6 +1059,114 @@ def compute_grpo_progpo_lata_outcome_advantage(
             * response_mask
             / length_norm
         )
+
+    return advantages, advantages
+
+
+@register_adv_est("grpo_salt_progpo_lata")
+def compute_grpo_salt_progpo_lata_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    progress_scores: torch.Tensor | np.ndarray | None = None,
+    outcome_rewards: torch.Tensor | np.ndarray | None = None,
+    salt_steps: np.ndarray | list[Any] | None = None,
+    salt_root_keys: np.ndarray | list[Any] | None = None,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+    diagnostics_out: Optional[dict[str, Any]] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """SALT credit assignment + conditional ProGPO + LATA transmission.
+
+    Mixed-outcome groups are refined by the outcome-only SALT graph. All-fail
+    groups keep ProGPO's trajectory-level progress fallback, avoiding an
+    unvalidated second redistribution of the progress signal. LATA is applied
+    last to every policy token.
+    """
+    if progress_scores is None:
+        raise ValueError(
+            "grpo_salt_progpo_lata requires non_tensor_batch['progress_score']"
+        )
+    if outcome_rewards is None:
+        raise ValueError(
+            "grpo_salt_progpo_lata requires non_tensor_batch['outcome_reward']"
+        )
+    if salt_steps is None:
+        raise ValueError(
+            "grpo_salt_progpo_lata requires non_tensor_batch['salt_steps'] from "
+            "ToolAgentLoop"
+        )
+
+    alpha = 1.05
+    tau_reward = 1e-3
+    tau_progress = 1e-4
+    lambda_aux = 0.3
+    lambda_fixed = False
+    history_length = 3
+    if config is not None:
+        td_config = getattr(config, "turn_discount", None)
+        if td_config is not None:
+            alpha = float(getattr(td_config, "alpha", alpha))
+        progpo_config = getattr(config, "progpo", None)
+        if progpo_config is not None:
+            tau_reward = float(getattr(progpo_config, "tau_reward", tau_reward))
+            tau_progress = float(getattr(progpo_config, "tau_progress", tau_progress))
+            lambda_aux = float(getattr(progpo_config, "lambda_aux", lambda_aux))
+            lambda_fixed = bool(getattr(progpo_config, "lambda_fixed", lambda_fixed))
+        salt_config = getattr(config, "salt", None)
+        if salt_config is not None:
+            history_length = int(
+                getattr(salt_config, "history_length", history_length)
+            )
+
+    base_scores = token_level_rewards.sum(dim=-1)
+    scalar_advantages, diagnostics = compute_progpo_group_scores(
+        base_scores,
+        progress_scores,
+        index,
+        outcome_rewards=outcome_rewards,
+        tau_reward=tau_reward,
+        tau_progress=tau_progress,
+        lambda_aux=lambda_aux,
+        lambda_fixed=lambda_fixed,
+        epsilon=epsilon,
+        norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+    )
+    step_scores, eligible_by_sample, salt_diagnostics = compute_salt_step_scores(
+        scalar_advantages,
+        index,
+        salt_steps,
+        root_keys=salt_root_keys,
+        outcome_rewards=outcome_rewards,
+        response_mask=response_mask,
+        history_length=history_length,
+        tau_reward=tau_reward,
+    )
+    token_scalars, span_diagnostics = _apply_salt_spans(
+        scalar_advantages,
+        step_scores,
+        eligible_by_sample,
+        salt_steps,
+        response_mask,
+    )
+    diagnostics.update(salt_diagnostics)
+    diagnostics.update(span_diagnostics)
+
+    with torch.no_grad():
+        active_lengths = response_mask.sum(dim=1, keepdim=True).clamp(min=1).to(torch.float64)
+        weights, lata_diagnostics = compute_lata_turn_weights(
+            response_mask,
+            salt_steps,
+            alpha=alpha,
+            epsilon=epsilon,
+        )
+        length_norm = torch.sqrt(active_lengths).to(torch.float32)
+        advantages = token_scalars * weights * response_mask / length_norm
+
+    diagnostics.update(lata_diagnostics)
+    if diagnostics_out is not None:
+        diagnostics_out.update(diagnostics)
 
     return advantages, advantages
 

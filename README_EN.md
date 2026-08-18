@@ -8,7 +8,7 @@
 > **Solving GRPO Training Collapse in Long-Horizon Multi-Tool Agents**  
 > A systematic ablation study on τ-bench airline (50-task, multi-turn, multi-tool conversational agents), achieving **+37% overall pass^1** over vanilla GRPO via a novel **PRM-Lite + LATA** joint approach.
 
-> Update: the active training path now adds **ProGPO + LATA** on the current tau2-bench Gym API. See [`docs/progpo_lata_tau2.md`](agentic-grpo-longhorizon/docs/progpo_lata_tau2.md). The numbers below remain the historical PRM-Lite results.
+> Update: the active training path now combines **SALT + ProGPO + LATA** on the current tau2-bench Gym API. See [`docs/salt_progpo_lata_tau2.md`](agentic-grpo-longhorizon/docs/salt_progpo_lata_tau2.md). The numbers below remain historical PRM-Lite results and are not claims for the new method.
 
 ---
 

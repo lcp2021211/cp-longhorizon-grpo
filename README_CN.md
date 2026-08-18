@@ -8,7 +8,7 @@
 > **解决长链路多工具智能体中的 GRPO 训练崩溃问题**  
 > 在 τ-bench airline（50 任务、多轮对话、多工具调用场景）上的系统性消融实验，通过创新的 **PRM-Lite + LATA 联合方案**，相较 Vanilla GRPO 基线实现 **+37% 的整体 pass^1 提升**。
 
-> 更新：主训练路径已新增 **ProGPO + LATA** 并迁移到当前 tau2-bench Gym API；新路径的说明见 [`docs/progpo_lata_tau2.md`](agentic-grpo-longhorizon/docs/progpo_lata_tau2.md)。下方数字仍是历史 PRM-Lite 实验结果。
+> 更新：主训练路径已升级为 **SALT + ProGPO + LATA** 并迁移到当前 tau2-bench Gym API；实现说明见 [`docs/salt_progpo_lata_tau2.md`](agentic-grpo-longhorizon/docs/salt_progpo_lata_tau2.md)。下方数字仍是历史 PRM-Lite 实验结果，不代表新方案成绩。
 
 ---
 
