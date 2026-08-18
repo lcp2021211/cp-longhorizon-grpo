@@ -41,7 +41,8 @@ deepspeed>=0.15.0
 # flash-attn 需从源码编译安装:
 #   pip install flash-attn --no-build-isolation
 # 要求: CUDA 12.x, PyTorch 已安装
-flash-attn>=2.4.0
+# Do not list it as a normal requirement: build isolation cannot see the
+# already-installed CUDA PyTorch. setup.sh installs it explicitly below.
 
 # ---- 数据 ----
 datasets>=3.0.0

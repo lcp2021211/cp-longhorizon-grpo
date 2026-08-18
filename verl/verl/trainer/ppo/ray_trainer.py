@@ -255,14 +255,18 @@ def compute_advantage(
             adv_kwargs["progress_scores"] = data.non_tensor_batch["progress_score"]
         if "outcome_reward" in data.non_tensor_batch:
             adv_kwargs["outcome_rewards"] = data.non_tensor_batch["outcome_reward"]
-        if adv_estimator == "grpo_salt_progpo_lata":
+        if adv_estimator in {"grpo_salt_progpo_lata", "grpo_agentic_ablation"}:
             if "salt_steps" in data.non_tensor_batch:
                 adv_kwargs["salt_steps"] = data.non_tensor_batch["salt_steps"]
             if "salt_root_key" in data.non_tensor_batch:
                 adv_kwargs["salt_root_keys"] = data.non_tensor_batch["salt_root_key"]
 
         progpo_diagnostics: dict[str, object] = {}
-        if adv_estimator in {"grpo_progpo_lata", "grpo_salt_progpo_lata"}:
+        if adv_estimator in {
+            "grpo_progpo_lata",
+            "grpo_salt_progpo_lata",
+            "grpo_agentic_ablation",
+        }:
             adv_kwargs["diagnostics_out"] = progpo_diagnostics
             adv_kwargs["norm_adv_by_std_in_grpo"] = norm_adv_by_std_in_grpo
 
@@ -271,8 +275,9 @@ def compute_advantage(
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
         if progpo_diagnostics:
-            branches = progpo_diagnostics.pop("progpo/branch_by_sample")
-            data.non_tensor_batch["progpo_branch"] = branches
+            branches = progpo_diagnostics.pop("progpo/branch_by_sample", None)
+            if branches is not None:
+                data.non_tensor_batch["progpo_branch"] = branches
             for field in ("progress_tool_score", "progress_user_score"):
                 if field in data.non_tensor_batch:
                     values = np.asarray(data.non_tensor_batch[field], dtype=float)

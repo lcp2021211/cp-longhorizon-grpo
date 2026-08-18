@@ -5,9 +5,11 @@ interaction:
     config:
       env_name: "airline"
       user_strategy: "llm"
-      user_model: "Qwen/Qwen2.5-72B-Instruct-AWQ"
-      user_provider: "openai"
-      user_base_url: "http://localhost:8001/v1"
+      # Any OpenAI-compatible local server or hosted API can be selected
+      # without editing this file. OPENAI_API_KEY is read by the adapter.
+      user_model: ${oc.env:TAU2_USER_MODEL,Qwen/Qwen2.5-72B-Instruct-AWQ}
+      user_provider: ${oc.env:TAU2_USER_PROVIDER,openai}
+      user_base_url: ${oc.env:TAU2_USER_BASE_URL,http://localhost:8001/v1}
       user_temperature: 0.0
       task_split: "base"
       task_id_mode: "id"

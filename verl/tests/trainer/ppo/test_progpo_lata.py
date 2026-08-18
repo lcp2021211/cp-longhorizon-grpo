@@ -5,6 +5,8 @@ import pytest
 import torch
 
 from verl.trainer.ppo.core_algos import (
+    compute_grpo_agentic_ablation_outcome_advantage,
+    compute_grpo_outcome_advantage,
     compute_grpo_progpo_lata_outcome_advantage,
     compute_grpo_salt_progpo_lata_outcome_advantage,
     compute_lata_turn_weights,
@@ -94,6 +96,24 @@ def _step(start, end, action, observation, action_type="tool", mergeable=True):
         "observation_key": observation,
         "mergeable": mergeable,
     }
+
+
+def _ablation_config(salt, progpo, lata, alpha=1.05):
+    return SimpleNamespace(
+        ablation=SimpleNamespace(
+            salt_enabled=salt,
+            progpo_enabled=progpo,
+            lata_enabled=lata,
+        ),
+        turn_discount=SimpleNamespace(alpha=alpha),
+        progpo=SimpleNamespace(
+            tau_reward=1e-3,
+            tau_progress=1e-4,
+            lambda_aux=0.3,
+            lambda_fixed=False,
+        ),
+        salt=SimpleNamespace(history_length=3),
+    )
 
 
 def test_salt_averages_shared_transition_and_preserves_divergent_steps():
@@ -340,3 +360,331 @@ def test_all_fail_progpo_uses_real_turn_lata_weights():
     assert abs(advantages[1, 0].item() / advantages[1, 1].item()) == pytest.approx(
         1.05
     )
+
+
+@pytest.mark.parametrize(
+    ("salt", "progpo", "lata"),
+    [
+        (False, False, False),
+        (True, False, False),
+        (False, True, False),
+        (False, False, True),
+        (True, True, False),
+        (True, False, True),
+        (False, True, True),
+        (True, True, True),
+    ],
+)
+def test_agentic_ablation_full_factorial_is_finite(salt, progpo, lata):
+    rewards = torch.tensor(
+        [
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+        ]
+    )
+    mask = torch.tensor([[1, 0, 1]] * 4)
+    outcomes = np.array([0.0, 1.0, 0.0, 0.0])
+    progress = np.array([0.2, 0.8, 0.1, 0.9])
+    groups = np.array(["mixed", "mixed", "all-fail", "all-fail"])
+    traces = np.empty(4, dtype=object)
+    traces[0] = [
+        _step(0, 1, "shared", "state"),
+        _step(2, 3, "wrong", "failed"),
+    ]
+    traces[1] = [
+        _step(0, 1, "shared", "state"),
+        _step(2, 3, "recover", "success"),
+    ]
+    traces[2] = [
+        _step(0, 1, "search-a", "partial-a"),
+        _step(2, 3, "stop-a", "failed"),
+    ]
+    traces[3] = [
+        _step(0, 1, "search-b", "partial-b"),
+        _step(2, 3, "stop-b", "failed"),
+    ]
+    diagnostics = {}
+
+    advantages, _ = compute_grpo_agentic_ablation_outcome_advantage(
+        rewards,
+        mask,
+        groups,
+        progress_scores=progress,
+        outcome_rewards=outcomes,
+        salt_steps=traces,
+        salt_root_keys=np.array(["m", "m", "f", "f"], dtype=object),
+        config=_ablation_config(salt, progpo, lata),
+        diagnostics_out=diagnostics,
+    )
+
+    assert torch.isfinite(advantages).all()
+    assert torch.equal(advantages[:, 1], torch.zeros(4))
+    assert diagnostics["ablation/salt_enabled"] == float(salt)
+    assert diagnostics["ablation/progpo_enabled"] == float(progpo)
+    assert diagnostics["ablation/lata_enabled"] == float(lata)
+
+
+def test_agentic_ablation_switches_are_orthogonal():
+    mixed_rewards = torch.tensor([[0.0, 0.0], [0.0, 1.0]])
+    mixed_mask = torch.ones((2, 2), dtype=torch.long)
+    mixed_traces = np.empty(2, dtype=object)
+    mixed_traces[0] = [
+        _step(0, 1, "shared", "state"),
+        _step(1, 2, "wrong", "failed"),
+    ]
+    mixed_traces[1] = [
+        _step(0, 1, "shared", "state"),
+        _step(1, 2, "recover", "success"),
+    ]
+    common = dict(
+        token_level_rewards=mixed_rewards,
+        response_mask=mixed_mask,
+        index=np.array(["mixed", "mixed"]),
+        progress_scores=np.array([0.2, 0.8]),
+        outcome_rewards=np.array([0.0, 1.0]),
+        salt_steps=mixed_traces,
+        salt_root_keys=np.array(["same", "same"], dtype=object),
+    )
+
+    vanilla, _ = compute_grpo_agentic_ablation_outcome_advantage(
+        **common, config=_ablation_config(False, False, False)
+    )
+    salt_only, _ = compute_grpo_agentic_ablation_outcome_advantage(
+        **common, config=_ablation_config(True, False, False)
+    )
+    lata_only, _ = compute_grpo_agentic_ablation_outcome_advantage(
+        **common, config=_ablation_config(False, False, True)
+    )
+
+    assert torch.all(vanilla[:, 0] != 0)
+    torch.testing.assert_close(salt_only[:, 0], torch.zeros(2))
+    assert abs(lata_only[0, 0].item() / lata_only[0, 1].item()) == pytest.approx(
+        1.05
+    )
+
+    all_fail_rewards = torch.zeros((2, 2))
+    all_fail_common = dict(
+        token_level_rewards=all_fail_rewards,
+        response_mask=mixed_mask,
+        index=np.array(["all-fail", "all-fail"]),
+        progress_scores=np.array([0.1, 0.9]),
+        outcome_rewards=np.array([0.0, 0.0]),
+        salt_steps=mixed_traces,
+    )
+    no_progpo, _ = compute_grpo_agentic_ablation_outcome_advantage(
+        **all_fail_common, config=_ablation_config(False, False, False)
+    )
+    progpo_only, _ = compute_grpo_agentic_ablation_outcome_advantage(
+        **all_fail_common, config=_ablation_config(False, True, False)
+    )
+    torch.testing.assert_close(no_progpo, torch.zeros_like(no_progpo))
+    assert torch.any(progpo_only != 0)
+
+
+def test_full_ablation_matches_dedicated_full_estimator():
+    rewards = torch.tensor([[0.0, 0.0], [0.0, 1.0]])
+    mask = torch.ones((2, 2), dtype=torch.long)
+    traces = np.empty(2, dtype=object)
+    traces[0] = [
+        _step(0, 1, "shared", "state"),
+        _step(1, 2, "wrong", "failed"),
+    ]
+    traces[1] = [
+        _step(0, 1, "shared", "state"),
+        _step(1, 2, "recover", "success"),
+    ]
+    common = dict(
+        token_level_rewards=rewards,
+        response_mask=mask,
+        index=np.array(["task", "task"]),
+        progress_scores=np.array([0.2, 0.8]),
+        outcome_rewards=np.array([0.0, 1.0]),
+        salt_steps=traces,
+        salt_root_keys=np.array(["same", "same"], dtype=object),
+    )
+    full_config = _ablation_config(True, True, True)
+
+    dedicated, _ = compute_grpo_salt_progpo_lata_outcome_advantage(
+        **common, config=full_config
+    )
+    composable, _ = compute_grpo_agentic_ablation_outcome_advantage(
+        **common, config=full_config
+    )
+
+    torch.testing.assert_close(composable, dedicated)
+
+
+@pytest.mark.parametrize("norm_adv_by_std", [False, True])
+def test_agentic_ablation_000_matches_builtin_vanilla_grpo(norm_adv_by_std):
+    """The all-off cell must be a numerical control, not a GRPO rewrite."""
+    rewards = torch.tensor(
+        [
+            [0.0, 0.0, 0.25, 0.0, 0.0],
+            [0.0, 0.0, 1.00, 0.0, 0.0],
+            [0.0, -0.5, 0.0, 0.0, 0.0],
+            [0.0, 0.75, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.5, 0.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    mask = torch.tensor(
+        [
+            [1, 1, 1, 0, 0],
+            [1, 0, 1, 1, 0],
+            [1, 1, 0, 0, 0],
+            [1, 1, 1, 1, 1],
+            [1, 1, 1, 0, 0],
+        ],
+        dtype=torch.long,
+    )
+    # task-c also locks down veRL's unusual singleton convention (mean=0).
+    groups = np.array(["task-a", "task-a", "task-b", "task-b", "task-c"])
+
+    expected, expected_returns = compute_grpo_outcome_advantage(
+        rewards,
+        mask,
+        groups,
+        norm_adv_by_std_in_grpo=norm_adv_by_std,
+    )
+    actual, actual_returns = compute_grpo_agentic_ablation_outcome_advantage(
+        rewards,
+        mask,
+        groups,
+        # Deliberately omit all optional rollout metadata in the 000 cell.
+        config=_ablation_config(False, False, False),
+        norm_adv_by_std_in_grpo=norm_adv_by_std,
+    )
+
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual_returns, expected_returns)
+
+
+def test_agentic_ablation_requires_progress_only_when_progpo_is_enabled():
+    rewards = torch.zeros((2, 2), dtype=torch.float32)
+    mask = torch.ones((2, 2), dtype=torch.long)
+    groups = np.array(["task", "task"])
+
+    with pytest.raises(ValueError, match="ProGPO ablation.*progress_score"):
+        compute_grpo_agentic_ablation_outcome_advantage(
+            rewards,
+            mask,
+            groups,
+            config=_ablation_config(False, True, False),
+        )
+
+    advantages, _ = compute_grpo_agentic_ablation_outcome_advantage(
+        rewards,
+        mask,
+        groups,
+        config=_ablation_config(False, False, False),
+    )
+    torch.testing.assert_close(advantages, torch.zeros_like(advantages))
+
+
+@pytest.mark.parametrize(
+    ("salt", "lata", "message"),
+    [
+        (True, False, "SALT ablation.*salt_steps"),
+        (False, True, "LATA ablation.*salt_steps"),
+    ],
+)
+def test_agentic_ablation_requires_turn_trace_only_for_trace_consumers(
+    salt, lata, message
+):
+    rewards = torch.tensor([[0.0, 0.0], [0.0, 1.0]])
+    mask = torch.ones((2, 2), dtype=torch.long)
+    groups = np.array(["task", "task"])
+
+    with pytest.raises(ValueError, match=message):
+        compute_grpo_agentic_ablation_outcome_advantage(
+            rewards,
+            mask,
+            groups,
+            outcome_rewards=np.array([0.0, 1.0]),
+            config=_ablation_config(salt, False, lata),
+        )
+
+    # The same rollout is valid when neither trace-consuming module is active.
+    advantages, _ = compute_grpo_agentic_ablation_outcome_advantage(
+        rewards,
+        mask,
+        groups,
+        config=_ablation_config(False, False, False),
+    )
+    assert torch.isfinite(advantages).all()
+
+
+@pytest.mark.parametrize(
+    ("salt", "progpo", "lata"),
+    [
+        (False, False, False),
+        (False, False, True),
+        (False, True, False),
+        (False, True, True),
+        (True, False, False),
+        (True, False, True),
+        (True, True, False),
+        (True, True, True),
+    ],
+)
+def test_agentic_ablation_zero_response_mask_is_finite_and_zero(
+    salt, progpo, lata
+):
+    rewards = torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+    mask = torch.zeros((2, 3), dtype=torch.long)
+    traces = np.empty(2, dtype=object)
+    traces[0] = []
+    traces[1] = []
+
+    advantages, returns = compute_grpo_agentic_ablation_outcome_advantage(
+        rewards,
+        mask,
+        np.array(["task", "task"]),
+        progress_scores=np.array([0.1, 0.9]),
+        outcome_rewards=np.array([0.0, 1.0]),
+        salt_steps=traces,
+        config=_ablation_config(salt, progpo, lata),
+    )
+
+    assert torch.isfinite(advantages).all()
+    assert torch.isfinite(returns).all()
+    torch.testing.assert_close(advantages, torch.zeros_like(advantages))
+    torch.testing.assert_close(returns, torch.zeros_like(returns))
+
+
+def test_agentic_ablation_invalid_salt_span_leaves_uncovered_tokens_on_trajectory_fallback():
+    rewards = torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+    mask = torch.ones((2, 3), dtype=torch.long)
+    groups = np.array(["task", "task"])
+    traces = np.empty(2, dtype=object)
+    traces[0] = [
+        _step(0, 1, "shared", "state"),
+        _step(1, 4, "wrong", "failed"),  # end is outside the response buffer
+    ]
+    traces[1] = [
+        _step(0, 1, "shared", "state"),
+        _step(1, 4, "recover", "success"),
+    ]
+    diagnostics = {}
+
+    vanilla, _ = compute_grpo_outcome_advantage(rewards, mask, groups)
+    advantages, _ = compute_grpo_agentic_ablation_outcome_advantage(
+        rewards,
+        mask,
+        groups,
+        outcome_rewards=np.array([0.0, 1.0]),
+        salt_steps=traces,
+        salt_root_keys=np.array(["same", "same"], dtype=object),
+        config=_ablation_config(True, False, False),
+        diagnostics_out=diagnostics,
+    )
+
+    # The valid shared transition is softened, while invalid/uncovered spans
+    # fail safely to each trajectory's original GRPO scalar.
+    torch.testing.assert_close(advantages[:, 0], torch.zeros(2))
+    torch.testing.assert_close(advantages[:, 1:], vanilla[:, 1:])
+    assert diagnostics["salt/graph_invalid_spans"] == 2
+    assert diagnostics["salt/invalid_spans"] == 2
+    assert diagnostics["salt/uncovered_token_rate"] == pytest.approx(2 / 3)

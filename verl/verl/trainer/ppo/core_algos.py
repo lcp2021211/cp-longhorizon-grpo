@@ -588,6 +588,46 @@ def compute_progpo_group_scores(
     return scalar_advantages, diagnostics
 
 
+def compute_grpo_group_scores(
+    base_scores: torch.Tensor,
+    index: np.ndarray,
+    *,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Compute the trajectory-scalar vanilla GRPO branch for ablations."""
+    if base_scores.ndim != 1 or len(base_scores) != len(index):
+        raise ValueError("GRPO scores and group index must align")
+
+    positions_by_group: dict[Any, list[int]] = defaultdict(list)
+    for position, group_id in enumerate(index):
+        positions_by_group[group_id].append(position)
+
+    scalar_advantages = torch.zeros_like(base_scores)
+    branch_by_sample = np.full(len(base_scores), "outcome", dtype=object)
+    with torch.no_grad():
+        for positions in positions_by_group.values():
+            group_scores = base_scores[positions]
+            if len(positions) == 1:
+                # Preserve veRL's original GRPO singleton convention exactly:
+                # mean=0 and std=1, so the only sample keeps its raw score.
+                group_mean = torch.zeros_like(group_scores[0])
+                group_std = torch.ones_like(group_scores[0])
+            else:
+                group_mean = torch.mean(group_scores)
+                group_std = torch.std(group_scores)
+            centered = group_scores - group_mean
+            if norm_adv_by_std_in_grpo:
+                centered = centered / (group_std + epsilon)
+            scalar_advantages[positions] = centered
+
+    diagnostics = {
+        "grpo/num_groups": int(len(positions_by_group)),
+        "progpo/branch_by_sample": branch_by_sample,
+    }
+    return scalar_advantages, diagnostics
+
+
 def _freeze_salt_key(value: Any) -> Any:
     """Convert JSON-like rollout metadata into a deterministic hashable key."""
     if isinstance(value, dict):
@@ -1168,6 +1208,143 @@ def compute_grpo_salt_progpo_lata_outcome_advantage(
     if diagnostics_out is not None:
         diagnostics_out.update(diagnostics)
 
+    return advantages, advantages
+
+
+@register_adv_est("grpo_agentic_ablation")
+def compute_grpo_agentic_ablation_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    progress_scores: torch.Tensor | np.ndarray | None = None,
+    outcome_rewards: torch.Tensor | np.ndarray | None = None,
+    salt_steps: np.ndarray | list[Any] | None = None,
+    salt_root_keys: np.ndarray | list[Any] | None = None,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+    diagnostics_out: Optional[dict[str, Any]] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Composable 2^3 ablation estimator for SALT, ProGPO, and LATA.
+
+    The three switches are intentionally orthogonal:
+
+    - ``salt_enabled`` refines only mixed-outcome groups at assistant-step level.
+    - ``progpo_enabled`` replaces all-fail zero signal with progress fallback.
+    - ``lata_enabled`` applies real-turn weighting and ``1/sqrt(L)`` scaling.
+
+    With every switch disabled this reproduces trajectory-level vanilla GRPO.
+    """
+    ablation_config = getattr(config, "ablation", None) if config is not None else None
+    salt_enabled = bool(getattr(ablation_config, "salt_enabled", False))
+    progpo_enabled = bool(getattr(ablation_config, "progpo_enabled", False))
+    lata_enabled = bool(getattr(ablation_config, "lata_enabled", False))
+
+    alpha = 1.05
+    tau_reward = 1e-3
+    tau_progress = 1e-4
+    lambda_aux = 0.3
+    lambda_fixed = False
+    history_length = 3
+    if config is not None:
+        td_config = getattr(config, "turn_discount", None)
+        if td_config is not None:
+            alpha = float(getattr(td_config, "alpha", alpha))
+        progpo_config = getattr(config, "progpo", None)
+        if progpo_config is not None:
+            tau_reward = float(getattr(progpo_config, "tau_reward", tau_reward))
+            tau_progress = float(getattr(progpo_config, "tau_progress", tau_progress))
+            lambda_aux = float(getattr(progpo_config, "lambda_aux", lambda_aux))
+            lambda_fixed = bool(getattr(progpo_config, "lambda_fixed", lambda_fixed))
+        salt_config = getattr(config, "salt", None)
+        if salt_config is not None:
+            history_length = int(getattr(salt_config, "history_length", history_length))
+
+    base_scores = token_level_rewards.sum(dim=-1)
+    outcome_for_branches = base_scores if outcome_rewards is None else outcome_rewards
+    if progpo_enabled:
+        if progress_scores is None:
+            raise ValueError(
+                "ProGPO ablation requires non_tensor_batch['progress_score']"
+            )
+        scalar_advantages, diagnostics = compute_progpo_group_scores(
+            base_scores,
+            progress_scores,
+            index,
+            outcome_rewards=outcome_for_branches,
+            tau_reward=tau_reward,
+            tau_progress=tau_progress,
+            lambda_aux=lambda_aux,
+            lambda_fixed=lambda_fixed,
+            epsilon=epsilon,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+        )
+    else:
+        scalar_advantages, diagnostics = compute_grpo_group_scores(
+            base_scores,
+            index,
+            epsilon=epsilon,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+        )
+
+    token_scalars = scalar_advantages.unsqueeze(-1).expand_as(response_mask).clone()
+    if salt_enabled:
+        if salt_steps is None:
+            raise ValueError(
+                "SALT ablation requires non_tensor_batch['salt_steps'] from ToolAgentLoop"
+            )
+        step_scores, eligible_by_sample, salt_diagnostics = compute_salt_step_scores(
+            scalar_advantages,
+            index,
+            salt_steps,
+            root_keys=salt_root_keys,
+            outcome_rewards=outcome_for_branches,
+            response_mask=response_mask,
+            history_length=history_length,
+            tau_reward=tau_reward,
+        )
+        token_scalars, span_diagnostics = _apply_salt_spans(
+            scalar_advantages,
+            step_scores,
+            eligible_by_sample,
+            salt_steps,
+            response_mask,
+        )
+        diagnostics.update(salt_diagnostics)
+        diagnostics.update(span_diagnostics)
+
+    with torch.no_grad():
+        if lata_enabled:
+            if salt_steps is None:
+                raise ValueError(
+                    "LATA ablation requires non_tensor_batch['salt_steps'] for turn spans"
+                )
+            weights, lata_diagnostics = compute_lata_turn_weights(
+                response_mask,
+                salt_steps,
+                alpha=alpha,
+                epsilon=epsilon,
+            )
+            active_lengths = response_mask.sum(dim=1, keepdim=True).clamp(min=1)
+            advantages = (
+                token_scalars
+                * weights
+                * response_mask
+                / torch.sqrt(active_lengths.to(torch.float32))
+            )
+            diagnostics.update(lata_diagnostics)
+        else:
+            advantages = token_scalars * response_mask
+
+    diagnostics.update(
+        {
+            "ablation/salt_enabled": float(salt_enabled),
+            "ablation/progpo_enabled": float(progpo_enabled),
+            "ablation/lata_enabled": float(lata_enabled),
+        }
+    )
+    if diagnostics_out is not None:
+        diagnostics_out.update(diagnostics)
     return advantages, advantages
 
 

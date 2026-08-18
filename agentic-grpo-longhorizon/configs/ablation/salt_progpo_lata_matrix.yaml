@@ -1,0 +1,42 @@
+# S/P/L bits correspond to SALT, ProGPO, and LATA.
+experiments:
+  "000_vanilla":
+    salt_enabled: false
+    progpo_enabled: false
+    lata_enabled: false
+    description: Vanilla trajectory-level GRPO
+  "100_salt":
+    salt_enabled: true
+    progpo_enabled: false
+    lata_enabled: false
+    description: SALT step assignment only
+  "010_progpo":
+    salt_enabled: false
+    progpo_enabled: true
+    lata_enabled: false
+    description: ProGPO all-fail fallback only
+  "001_lata":
+    salt_enabled: false
+    progpo_enabled: false
+    lata_enabled: true
+    description: Real-turn LATA only
+  "110_salt_progpo":
+    salt_enabled: true
+    progpo_enabled: true
+    lata_enabled: false
+    description: SALT plus ProGPO
+  "101_salt_lata":
+    salt_enabled: true
+    progpo_enabled: false
+    lata_enabled: true
+    description: SALT plus real-turn LATA
+  "011_progpo_lata":
+    salt_enabled: false
+    progpo_enabled: true
+    lata_enabled: true
+    description: ProGPO plus real-turn LATA
+  "111_full":
+    salt_enabled: true
+    progpo_enabled: true
+    lata_enabled: true
+    description: Full SALT plus ProGPO plus LATA

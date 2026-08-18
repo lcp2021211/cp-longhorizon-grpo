@@ -1,10 +1,12 @@
 #!/bin/bash
-# 启动 SFT 合并后的 7B vLLM server
-# 注意 served-model-name 保持 "Qwen/Qwen2.5-7B-Instruct"，让 policy 配置不用改
+# 启动导出的 7B checkpoint vLLM server（SFT 或 RL 均可）
+# served-model-name 保持稳定，让评测 policy 配置不用改。
 
 set -e
 
-MODEL_PATH=${MODEL_PATH:-"experiments/sft_lora_merged"}
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+MODEL_PATH=${MODEL_PATH:-"${PROJECT_DIR}/experiments/sft_lora_merged"}
 PORT=${PORT:-8000}
 TP_SIZE=${TP_SIZE:-1}
 GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.82}
@@ -20,12 +22,12 @@ echo "GPU:    $CUDA_DEVICES"
 export CUDA_VISIBLE_DEVICES=$CUDA_DEVICES
 
 python -m vllm.entrypoints.openai.api_server \
-    --model $MODEL_PATH \
+    --model "$MODEL_PATH" \
     --served-model-name "Qwen/Qwen2.5-7B-Instruct" \
-    --port $PORT \
-    --tensor-parallel-size $TP_SIZE \
-    --gpu-memory-utilization $GPU_MEM_UTIL \
-    --max-model-len $MAX_MODEL_LEN \
+    --port "$PORT" \
+    --tensor-parallel-size "$TP_SIZE" \
+    --gpu-memory-utilization "$GPU_MEM_UTIL" \
+    --max-model-len "$MAX_MODEL_LEN" \
     --max-num-seqs 8 \
     --enable-prefix-caching \
     --enable-auto-tool-choice \

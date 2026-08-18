@@ -49,10 +49,10 @@ class EvalReport:
     env_name: str
     num_tasks: int
     num_samples_per_task: int
-    pass_at_1: float           # 任意一次成功
-    pass_hat_1: float          # pass^1: 平均成功率
-    pass_hat_4: float          # pass^4: 连续 4 次都成功的比例(稳定性)
-    pass_hat_8: float
+    pass_at_1: float           # legacy name: task solved at least once among N samples
+    pass_hat_1: float          # single-sample average success rate
+    pass_hat_4: float          # legacy name: HumanEval-style pass@4 estimate
+    pass_hat_8: float          # legacy name: HumanEval-style pass@8 estimate
     avg_turns: float
     avg_tool_calls: float
     error_rate: float          # trajectory 异常中止的比例
@@ -94,9 +94,8 @@ def run_eval(
             task_idx, traj = fut.result()
             results[task_idx].append(traj)
     
-    # 计算 pass^k
-    # pass^k 定义: 对同一个 task 采样 n 次,估计"连续 k 次都成功"的概率
-    # 用 unbiased estimator (HumanEval 里的 pass@k 公式)
+    # Compute HumanEval-style pass@k: probability of at least one success in
+    # k draws. Historical JSON field names are retained for compatibility.
     import numpy as np
     
     def pass_at_k(n: int, c: int, k: int) -> float:
@@ -111,7 +110,7 @@ def run_eval(
 
     per_task = []
     pass_1_list, pass_4_list, pass_8_list = [], [], []
-    pass_at_1_list = []  # 任意一次成功
+    pass_at_1_list = []  # legacy field: any success among all N samples
     all_turns, all_tool_calls, all_errors = [], [], []
 
     for t in range(num_tasks):
@@ -176,10 +175,19 @@ def run_eval(
     # 打印摘要
     print(f"\n=== Eval Report: {wrapper.env_name} ===")
     print(f"Tasks: {num_tasks} × Samples: {num_samples_per_task}")
-    print(f"pass@1 (any success): {report.pass_at_1:.3f}")
-    print(f"pass^1 (avg success): {report.pass_hat_1:.3f}")
-    print(f"pass^4 (stability):   {report.pass_hat_4:.3f}")
-    print(f"pass^8 (stability):   {report.pass_hat_8:.3f}")
+    print(
+        f"task solved@{num_samples_per_task} (legacy pass_at_1): "
+        f"{report.pass_at_1:.3f}"
+    )
+    print(f"single-sample success rate (pass_hat_1): {report.pass_hat_1:.3f}")
+    if num_samples_per_task >= 4:
+        print(f"pass@4 estimate (legacy pass_hat_4):     {report.pass_hat_4:.3f}")
+    else:
+        print("pass@4 estimate (legacy pass_hat_4):     N/A (N < 4)")
+    if num_samples_per_task >= 8:
+        print(f"pass@8 estimate (legacy pass_hat_8):     {report.pass_hat_8:.3f}")
+    else:
+        print("pass@8 estimate (legacy pass_hat_8):     N/A (N < 8)")
     print(f"Avg turns:       {report.avg_turns:.2f}")
     print(f"Avg tool calls:  {report.avg_tool_calls:.2f}")
     print(f"Error rate:      {report.error_rate:.3f}")

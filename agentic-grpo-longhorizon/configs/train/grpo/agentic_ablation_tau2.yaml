@@ -1,0 +1,125 @@
+# Fair 2^3 ablation base for SALT, ProGPO, and real-turn LATA.
+hydra:
+  searchpath:
+    - pkg://verl/trainer/config
+  job:
+    # Keep every relative data/output path anchored at the project directory.
+    chdir: false
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+data:
+  train_files: experiments/tau2/train.parquet
+  val_files: experiments/tau2/val.parquet
+  train_batch_size: 4
+  max_prompt_length: 8192
+  max_response_length: 12288
+  return_raw_chat: true
+  tool_config_path: configs/tool_config/tau_bench_airline_tools.yaml
+  seed: 42
+
+actor_rollout_ref:
+  model:
+    # Override both actor/ref paths with runner --model-path when needed.
+    path: experiments/sft_lora_merged
+    enable_gradient_checkpointing: true
+    lora_rank: 16
+    lora_alpha: 32
+    use_fused_kernels: true
+    fused_kernel_options:
+      impl_backend: torch
+    override_config:
+      attn_implementation: flash_attention_2
+  actor:
+    fsdp_config:
+      optimizer_offload: true
+      param_offload: true
+      model_dtype: bf16
+    optim:
+      lr: 5.0e-6
+    use_kl_loss: true
+    kl_loss_coef: 0.01
+    kl_loss_type: low_var_kl
+    use_fused_kernels: true
+    ppo_mini_batch_size: 4
+    ppo_micro_batch_size_per_gpu: 2
+  rollout:
+    name: vllm
+    mode: async
+    agent:
+      default_agent_loop: tool_agent
+    multi_turn:
+      enable: true
+      format: hermes
+      max_user_turns: 15
+      max_assistant_turns: 15
+      max_parallel_calls: 1
+      tool_config_path: configs/tool_config/tau_bench_airline_tools.yaml
+      interaction_config_path: configs/interaction_config/tau2_airline_progpo.yaml
+    # Fixed for every variant. SALT paper default group size is 8.
+    n: 8
+    temperature: 0.7
+    top_p: 0.9
+    tensor_model_parallel_size: 1
+    calculate_log_probs: true
+    gpu_memory_utilization: 0.5
+    free_cache_engine: true
+    max_num_seqs: 12
+    max_model_len: 24576
+    max_num_batched_tokens: 24576
+    log_prob_micro_batch_size_per_gpu: 2
+    val_kwargs:
+      n: 1
+      # Deterministic if explicitly enabled; official test is disabled in-train.
+      temperature: 0.0
+      top_p: 1.0
+  ref:
+    fsdp_config:
+      optimizer_offload: true
+      param_offload: true
+      model_dtype: bf16
+    model:
+      path: experiments/sft_lora_merged
+      override_config:
+        attn_implementation: flash_attention_2
+    log_prob_micro_batch_size_per_gpu: 2
+
+algorithm:
+  adv_estimator: grpo_agentic_ablation
+  kl_ctrl:
+    kl_coef: 0.01
+  rollout_correction:
+    bypass_mode: true
+  # The matrix runner overrides only these three switches.
+  ablation:
+    salt_enabled: true
+    progpo_enabled: true
+    lata_enabled: true
+  salt:
+    history_length: 3
+  progpo:
+    tau_reward: 1.0e-3
+    tau_progress: 1.0e-4
+    lambda_aux: 0.3
+    lambda_fixed: false
+  turn_discount:
+    enable: true
+    alpha: 1.05
+
+trainer:
+  total_epochs: 50
+  total_training_steps: 300
+  save_freq: 50
+  # Do not repeatedly observe the official held-out test split while training.
+  val_before_train: false
+  test_freq: -1
+  resume_mode: auto
+  default_local_dir: experiments/ablations/111_full/checkpoints
+  # Console is dependency-free. Override with [console,swanlab] after login.
+  logger: [console]
+  project_name: agentic-grpo-longhorizon-ablation
+  experiment_name: 111_full
+  n_gpus_per_node: 1
+  nnodes: 1

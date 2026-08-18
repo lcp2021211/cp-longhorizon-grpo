@@ -1,22 +1,9 @@
-"""
-SFT 后评测 : 按 covered-seen / uncovered-seen / unseen / overall 四组报数
+"""Evaluate an exported policy with the current tau2 Gym adapter.
 
-分组逻辑:
-- covered-seen:   seen task 中采集阶段有成功 trajectory 的（模型训练时见过数据）
-- uncovered-seen: seen task 中采集阶段无成功 trajectory 的（模型训练时没见过该 task 的数据）
-- unseen:         完全没见过的 holdout task（out-of-distribution）
-- overall:        全 50 个 task，跟 baseline 直接对比
-
-读 split.json 拿到 seen/unseen 静态切分，再扫描 task_*.jsonl 文件大小判断 covered/uncovered。
-如果不传 --split-file，就只报 overall 一组。
-
-用法:
-    bash scripts/vllm_server/72b.sh         # GPU1 (user sim)
-    bash scripts/vllm_server/7b_sft.sh      # GPU0 (SFT policy)
-
-    python scripts/eval/eval_sft.py \
-        --config configs/eval/eval_sft_airline.yaml \
-        --split-file experiments/sft_collect_airline/split.json
+Without ``--split-file`` this reports the official tau2 split as one overall
+set, which is the supported path for the new ablations. ``--split-file`` keeps
+the historical 50-task covered/uncovered report available for legacy results;
+that split must not be used for the current official train/test experiment.
 """
 import sys
 from pathlib import Path
@@ -106,6 +93,16 @@ def main():
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
+
+    # Match the training interaction config: the same local or hosted user
+    # simulator can be selected without generating a second YAML file.
+    for config_key, env_name in (
+        ("user_model", "TAU2_USER_MODEL"),
+        ("user_provider", "TAU2_USER_PROVIDER"),
+        ("user_base_url", "TAU2_USER_BASE_URL"),
+    ):
+        if value := os.environ.get(env_name):
+            cfg["env"][config_key] = value
 
     if args.tiny:
         cfg["eval"]["num_tasks"] = 4
@@ -231,15 +228,16 @@ def main():
               f"({'过拟合明显' if covered_minus_unseen > 0.10 else 'gap 小，泛化好' if covered_minus_unseen < 0.02 else 'gap 中等'})")
         print(f"\n  分组报告: {out_path}")
     else:
-        # 兼容模式: 只报 overall
-        print(f"\n=== 与 baseline (72B-user) 对比 ===")
-        print(f"  baseline:  pass^1 = 0.160, pass@1 = 0.340, avg_turns = 12.29")
-        print(f"  SFT:       pass^1 = {report.pass_hat_1:.3f}, "
-              f"pass@1 = {report.pass_at_1:.3f}, "
-              f"avg_turns = {report.avg_turns:.2f}")
-        delta = report.pass_hat_1 - 0.160
-        print(f"  Δ pass^1:  {delta:+.3f}  "
-              f"{'✅ 达标 (>=+0.05)' if delta >= 0.05 else '⚠️ 未达标'}")
+        # Current tau2 mode: do not compare against the incompatible legacy
+        # 50-task baseline. The JSON field names remain backward compatible.
+        print("\n=== Current tau2 overall ===")
+        print(f"  success rate (pass_hat_1): {report.pass_hat_1:.3f}")
+        print(
+            f"  task solved at least once among "
+            f"{report.num_samples_per_task} samples (legacy pass_at_1): "
+            f"{report.pass_at_1:.3f}"
+        )
+        print(f"  avg_turns: {report.avg_turns:.2f}")
 
 
 if __name__ == "__main__":
