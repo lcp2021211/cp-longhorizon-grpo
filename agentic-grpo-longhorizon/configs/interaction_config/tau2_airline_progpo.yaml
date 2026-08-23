@@ -1,0 +1,16 @@
+# Current tau2-bench Gym interaction for ProGPO training.
+interaction:
+  - name: "tau_bench_airline"
+    class_name: "src.envs.tau_bench_interaction.TauBenchInteraction"
+    config:
+      env_name: "airline"
+      user_strategy: "llm"
+      user_model: "Qwen/Qwen2.5-72B-Instruct-AWQ"
+      user_provider: "openai"
+      user_base_url: "http://localhost:8001/v1"
+      user_temperature: 0.0
+      task_split: "base"
+      task_id_mode: "id"
+      max_turns: 30
+      # Outcome stays binary. Progress is carried separately to the estimator.
+      reward_mode: "progpo"
