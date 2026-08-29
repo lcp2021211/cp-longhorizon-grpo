@@ -705,7 +705,7 @@ class CommandTests(Tau2IdentityTestCase):
             self.assertIn("trainer.total_epochs=12", command)
             self.assertIn(f"trainer.default_local_dir={checkpoint_dir}", command)
             self.assertIn("actor_rollout_ref.model.path=/models/policy", command)
-            self.assertIn("actor_rollout_ref.ref.model.path=/models/policy", command)
+            self.assertNotIn("actor_rollout_ref.ref.model.path=", command)
             self.assertIn("hydra.job.chdir=false", command)
 
     def test_dry_run_has_no_filesystem_side_effects_and_builds_data_once(self):

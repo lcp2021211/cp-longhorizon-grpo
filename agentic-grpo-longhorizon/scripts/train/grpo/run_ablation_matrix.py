@@ -72,14 +72,14 @@ IMPLEMENTATION_PATHS = (
     ("tau2_context", "project", "src/envs/tau_bench_context.py"),
     ("tau2_interaction", "project", "src/envs/tau_bench_interaction.py"),
     ("tau2_tools", "project", "src/envs/tau_bench_tools.py"),
-    ("salt_trace", "repository", "verl/verl/experimental/agent_loop/salt_trace.py"),
+    ("salt_trace", "repository", "verl_qwen35/verl/experimental/agent_loop/salt_trace.py"),
     (
         "tool_agent_loop",
         "repository",
-        "verl/verl/experimental/agent_loop/tool_agent_loop.py",
+        "verl_qwen35/verl/experimental/agent_loop/tool_agent_loop.py",
     ),
-    ("core_algos", "repository", "verl/verl/trainer/ppo/core_algos.py"),
-    ("ray_trainer", "repository", "verl/verl/trainer/ppo/ray_trainer.py"),
+    ("core_algos", "repository", "verl_qwen35/verl/trainer/ppo/core_algos.py"),
+    ("ray_trainer", "repository", "verl_qwen35/verl/trainer/ppo/ray_trainer.py"),
 )
 TAU2_ENVIRONMENT_KEYS = (
     ("TAU2_USER_MODEL", "user_model"),
@@ -419,18 +419,15 @@ def resolve_model_references(
         return effective, effective
     try:
         actor = training_config["actor_rollout_ref"]["model"]["path"]
-        reference = training_config["actor_rollout_ref"]["ref"]["model"]["path"]
     except (KeyError, TypeError) as exc:
         raise RunnerError(
-            "Training config must define actor_rollout_ref.model.path and "
-            "actor_rollout_ref.ref.model.path"
+            "Training config must define actor_rollout_ref.model.path"
         ) from exc
-    if not isinstance(actor, str) or not isinstance(reference, str):
-        raise RunnerError("Actor and reference model paths must be strings")
-    return (
-        normalize_model_reference(actor, project_dir),
-        normalize_model_reference(reference, project_dir),
-    )
+    if not isinstance(actor, str):
+        raise RunnerError("Actor/reference model path must be a string")
+    effective = normalize_model_reference(actor, project_dir)
+    # Modern veRL shares actor_rollout_ref.model between actor and reference.
+    return effective, effective
 
 
 def _nested_config_value(
@@ -1166,12 +1163,7 @@ def build_training_command(
         "hydra.job.chdir=false",
     ]
     if model_path is not None:
-        command.extend(
-            [
-                f"actor_rollout_ref.model.path={model_path}",
-                f"actor_rollout_ref.ref.model.path={model_path}",
-            ]
-        )
+        command.append(f"actor_rollout_ref.model.path={model_path}")
     return command
 
 
