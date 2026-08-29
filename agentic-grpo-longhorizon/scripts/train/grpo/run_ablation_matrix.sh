@@ -2,7 +2,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONDA_ENV_NAME="${CONDA_ENV_NAME:-agentrl}"
+PROJECT_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+REPOSITORY_DIR="$(cd "${PROJECT_DIR}/.." && pwd)"
+VERL_SOURCE_DIR="${VERL_SOURCE_DIR:-${REPOSITORY_DIR}/verl_qwen35}"
+CONDA_ENV_NAME="${CONDA_ENV_NAME:-agentrl-qwen35}"
 
 if [[ "${SKIP_CONDA_ACTIVATE:-0}" != "1" ]]; then
     if ! command -v conda >/dev/null 2>&1; then
@@ -14,9 +17,17 @@ if [[ "${SKIP_CONDA_ACTIVATE:-0}" != "1" ]]; then
     conda activate "${CONDA_ENV_NAME}"
 fi
 
-export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-12.4}"
+if [[ ! -d "${VERL_SOURCE_DIR}/verl" ]]; then
+    echo "Compatible veRL source was not found: ${VERL_SOURCE_DIR}" >&2
+    exit 1
+fi
+export PYTHONPATH="${VERL_SOURCE_DIR}:${PROJECT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-12.8}"
 export TRITON_PTXAS_PATH="${TRITON_PTXAS_PATH:-${CUDA_HOME}/bin/ptxas}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export POLICY_MODEL_PATH="${POLICY_MODEL_PATH:-/media/public/models/huggingface/Qwen/Qwen3.5-9B}"
+export TAU2_USER_MODEL="${TAU2_USER_MODEL:-Qwen/Qwen3.6-35B-A3B}"
+export TAU2_USER_BASE_URL="${TAU2_USER_BASE_URL:-http://localhost:8001/v1}"
 export DS_SKIP_TRITON="${DS_SKIP_TRITON:-1}"
 export RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO="${RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO:-0}"
 export VLLM_USE_V1="${VLLM_USE_V1:-1}"

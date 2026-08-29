@@ -7,10 +7,19 @@ interaction:
       user_strategy: "llm"
       # Any OpenAI-compatible local server or hosted API can be selected
       # without editing this file. OPENAI_API_KEY is read by the adapter.
-      user_model: ${oc.env:TAU2_USER_MODEL,Qwen/Qwen2.5-72B-Instruct-AWQ}
+      user_model: ${oc.env:TAU2_USER_MODEL,Qwen/Qwen3.6-35B-A3B}
       user_provider: ${oc.env:TAU2_USER_PROVIDER,openai}
       user_base_url: ${oc.env:TAU2_USER_BASE_URL,http://localhost:8001/v1}
-      user_temperature: 0.0
+      # Official Qwen3.6 non-thinking sampling settings.
+      user_temperature: 0.7
+      user_llm_args:
+        top_p: 0.8
+        max_tokens: 1024
+        presence_penalty: 1.5
+        extra_body:
+          top_k: 20
+          chat_template_kwargs:
+            enable_thinking: false
       task_split: "base"
       task_id_mode: "id"
       max_turns: 30
