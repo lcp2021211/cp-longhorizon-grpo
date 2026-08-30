@@ -80,6 +80,23 @@ IMPLEMENTATION_PATHS = (
     ),
     ("core_algos", "repository", "verl_qwen35/verl/trainer/ppo/core_algos.py"),
     ("ray_trainer", "repository", "verl_qwen35/verl/trainer/ppo/ray_trainer.py"),
+    ("main_ppo", "repository", "verl_qwen35/verl/trainer/main_ppo.py"),
+    ("fsdp_workers", "repository", "verl_qwen35/verl/workers/fsdp_workers.py"),
+    (
+        "compact_lora_checkpoint",
+        "repository",
+        "verl_qwen35/verl/utils/checkpoint/lora_checkpoint.py",
+    ),
+    (
+        "checkpoint_manager",
+        "repository",
+        "verl_qwen35/verl/utils/checkpoint/checkpoint_manager.py",
+    ),
+    (
+        "fsdp_checkpoint_manager",
+        "repository",
+        "verl_qwen35/verl/utils/checkpoint/fsdp_checkpoint_manager.py",
+    ),
 )
 TAU2_ENVIRONMENT_KEYS = (
     ("TAU2_USER_MODEL", "user_model"),

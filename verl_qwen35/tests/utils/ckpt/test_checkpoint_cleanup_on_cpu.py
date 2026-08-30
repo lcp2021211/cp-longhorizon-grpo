@@ -137,3 +137,19 @@ class TestCheckpointCleanupLogic:
         manager.register_checkpoint(ckpt_300, 1)
         assert not os.path.exists(ckpt_200)
         assert manager.previous_saved_paths == [ckpt_300]
+
+    def test_restore_history_keeps_limit_across_process_restart(self, manager):
+        """A resumed process must discover and rotate pre-existing actor checkpoints."""
+        actor_100 = os.path.join(self.test_dir, "global_step_100", "actor")
+        actor_200 = os.path.join(self.test_dir, "global_step_200", "actor")
+        os.makedirs(actor_100)
+        os.makedirs(actor_200)
+        next_actor = os.path.join(self.test_dir, "global_step_300", "actor")
+
+        manager.restore_checkpoint_history(next_actor)
+        assert manager.previous_saved_paths == [actor_100, actor_200]
+
+        manager.ensure_checkpoint_capacity(max_ckpt_to_keep=2)
+        assert not os.path.exists(actor_100)
+        assert os.path.isdir(actor_200)
+        assert manager.previous_saved_paths == [actor_200]
