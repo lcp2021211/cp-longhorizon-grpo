@@ -132,12 +132,21 @@ def get_vl_model_vision_tower(vl_model_instance):
     """
     Util to extract Vision Tower from a VL model instance
     """
-    if hasattr(vl_model_instance, "model") and hasattr(vl_model_instance.model, "visual"):
-        # transformers >= 4.52.0
-        return vl_model_instance.model.visual
-    elif hasattr(vl_model_instance, "visual"):
-        # transformers < 4.52.0
-        return vl_model_instance.visual
+    # PEFT wraps the Transformers model as PeftModel -> LoraModel -> model.
+    # Walk those wrappers so freeze_vision_tower also works after LoRA is added.
+    candidates = [vl_model_instance]
+    visited = set()
+    while candidates:
+        candidate = candidates.pop(0)
+        if candidate is None or id(candidate) in visited:
+            continue
+        visited.add(id(candidate))
+        if hasattr(candidate, "visual"):
+            return candidate.visual
+        for attribute in ("model", "base_model"):
+            wrapped = getattr(candidate, attribute, None)
+            if wrapped is not None and wrapped is not candidate:
+                candidates.append(wrapped)
     return None
 
 

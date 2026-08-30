@@ -27,6 +27,21 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _vision_tower_is_trainable(model: torch.nn.Module) -> bool:
+    """Return whether the vision tower must participate in a text-only forward."""
+    visual = getattr(model, "visual", None)
+    return visual is not None and any(parameter.requires_grad for parameter in visual.parameters())
+
+
+def _ensure_text_rotary_buffers_on_device(language_model: torch.nn.Module, device: torch.device) -> None:
+    """Keep Qwen3.5's non-persistent RoPE buffers with the active text inputs."""
+    rotary_emb = getattr(language_model, "rotary_emb", None)
+    if rotary_emb is None:
+        return
+    if any(buffer.device != device for buffer in rotary_emb.buffers()):
+        rotary_emb.to(device=device, non_blocking=True)
+
+
 def fast_pos_embed_interpolate(self, grid_thw):
     grid_thw_list = grid_thw.tolist()
     grid_ts = [row[0] for row in grid_thw_list]
@@ -138,7 +153,11 @@ def _get_input_embeds(
         video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
         inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
-    if pixel_values is None and pixel_values_videos is None:
+    # The dummy vision pass keeps trainable vision parameters in the graph for
+    # mixed multimodal batches. It is unnecessary for this project's frozen,
+    # text-only vision tower and is unsafe with FSDP2 CPU offload because frozen
+    # vision buffers can remain on CPU while the dummy pixels are on CUDA.
+    if pixel_values is None and pixel_values_videos is None and _vision_tower_is_trainable(model):
         config = model.config.vision_config
         patch_dim = config.in_channels * config.temporal_patch_size * config.patch_size**2
         pixel_values = torch.zeros((16, patch_dim), dtype=inputs_embeds.dtype, device=inputs_embeds.device)
@@ -166,6 +185,7 @@ def qwen3_5_base_forward(
         self, input_ids, attention_mask, pixel_values, pixel_values_videos, image_grid_thw, video_grid_thw
     )  # avoid lora module having multiple keyword arguments
     kwargs.update(input_kwargs)
+    _ensure_text_rotary_buffers_on_device(self.language_model, input_kwargs["inputs_embeds"].device)
     return self.language_model(
         input_ids=None,
         **kwargs,

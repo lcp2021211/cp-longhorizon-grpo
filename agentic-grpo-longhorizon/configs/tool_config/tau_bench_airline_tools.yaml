@@ -230,6 +230,7 @@ tools:
       description: Returns a list of all available airports.
       parameters:
         properties: {}
+        required: []
         title: parameters
         type: object
 - class_name: src.envs.tau_bench_tools.TauBench_search_direct_flight_Tool
@@ -514,5 +515,6 @@ tools:
       description: Call this function when you are done with the task.
       parameters:
         properties: {}
+        required: []
         title: parameters
         type: object

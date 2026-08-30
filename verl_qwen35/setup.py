@@ -41,6 +41,7 @@ install_requires = [
     "torchdata",
     "tensordict>=0.8.0,<=0.10.0,!=0.9.0",
     "transformers>=5.5.3,<5.11",
+    "qwen-vl-utils==0.0.14",
     "wandb",
     "packaging>=20.0",
     "tensorboard",
