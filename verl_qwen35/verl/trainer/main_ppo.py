@@ -315,9 +315,14 @@ class TaskRunner:
 
         from omegaconf import OmegaConf
 
+        from verl.utils.checkpoint.lora_checkpoint import prepare_compact_lora_resume
         from verl.utils.fs import copy_to_local
 
         print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
+        # Compact LoRA checkpoints intentionally omit the frozen base weights.
+        # Select the saved adapter before worker/FSDP construction so PEFT,
+        # FSDP parameter identities, and optimizer state all line up exactly.
+        prepare_compact_lora_resume(config)
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
 

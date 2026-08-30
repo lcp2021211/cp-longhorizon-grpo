@@ -25,10 +25,99 @@ except ImportError:
     from torch.distributed._tensor import DTensor
 
 
-def merge_fsdp_checkpoint(actor_dir: str, output_dir: str, merge_lora: bool = True):
+COMPACT_LORA_METADATA = "compact_lora_checkpoint.json"
+
+
+def merge_compact_lora_checkpoint(
+    actor_path: Path,
+    out_path: Path,
+    base_model_override: Optional[str] = None,
+):
+    """Merge a compact base-model + PEFT-adapter checkpoint on CPU."""
+
+    from peft import PeftModel
+    from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
+
+    try:
+        from transformers import AutoModelForImageTextToText
+    except ImportError:
+        AutoModelForImageTextToText = None
+    try:
+        from transformers import AutoModelForVision2Seq
+    except ImportError:
+        AutoModelForVision2Seq = None
+
+    metadata_path = actor_path / COMPACT_LORA_METADATA
+    with metadata_path.open(encoding="utf-8") as handle:
+        metadata = json.load(handle)
+    if metadata.get("format") != "verl-compact-lora-v1":
+        raise ValueError(f"Unsupported compact checkpoint format: {metadata.get('format')!r}")
+
+    base_model_path = base_model_override or metadata.get("base_model_path")
+    if not base_model_path:
+        raise ValueError(f"Missing base_model_path in {metadata_path}")
+    adapter_path = actor_path / "lora_adapter"
+    if not (adapter_path / "adapter_model.safetensors").is_file():
+        raise FileNotFoundError(f"Missing compact LoRA adapter: {adapter_path}")
+
+    config = AutoConfig.from_pretrained(base_model_path, trust_remote_code=True)
+    config_type = type(config)
+    if config_type in AutoModelForCausalLM._model_mapping:
+        model_class = AutoModelForCausalLM
+    elif AutoModelForImageTextToText is not None and config_type in AutoModelForImageTextToText._model_mapping:
+        model_class = AutoModelForImageTextToText
+    elif AutoModelForVision2Seq is not None and config_type in AutoModelForVision2Seq._model_mapping:
+        model_class = AutoModelForVision2Seq
+    else:
+        model_class = AutoModel
+
+    print(f"Loading frozen base model from {base_model_path} as bfloat16 ...")
+    base_model = model_class.from_pretrained(
+        base_model_path,
+        config=config,
+        dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+        trust_remote_code=True,
+    )
+    print(f"Loading compact LoRA adapter from {adapter_path} ...")
+    peft_model = PeftModel.from_pretrained(base_model, adapter_path, is_trainable=False)
+    print("Merging LoRA adapter into the frozen base model ...")
+    merged_model = peft_model.merge_and_unload(safe_merge=True, progressbar=True)
+    print(f"Saving merged Hugging Face model to {out_path} ...")
+    merged_model.save_pretrained(out_path, safe_serialization=True, max_shard_size="5GB")
+
+    # Preserve all tokenizer/processor assets without importing project code.
+    from transformers import AutoProcessor, AutoTokenizer
+
+    try:
+        AutoProcessor.from_pretrained(base_model_path, trust_remote_code=True).save_pretrained(out_path)
+    except Exception as exc:
+        print(f"Warning: processor export skipped: {exc}")
+    try:
+        AutoTokenizer.from_pretrained(base_model_path, trust_remote_code=True).save_pretrained(out_path)
+    except Exception as exc:
+        print(f"Warning: tokenizer export skipped: {exc}")
+    print(f"Done! Output at {out_path}")
+
+
+def merge_fsdp_checkpoint(
+    actor_dir: str,
+    output_dir: str,
+    merge_lora: bool = True,
+    base_model_override: Optional[str] = None,
+):
     actor_path = Path(actor_dir)
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
+
+    if (actor_path / COMPACT_LORA_METADATA).is_file():
+        if not merge_lora:
+            raise ValueError(
+                "--no-merge-lora is not supported for compact checkpoints; "
+                "use actor/lora_adapter directly"
+            )
+        merge_compact_lora_checkpoint(actor_path, out_path, base_model_override)
+        return
 
     # 1. Read FSDP config
     with open(actor_path / "fsdp_config.json") as f:
@@ -164,5 +253,12 @@ if __name__ == "__main__":
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--no-merge-lora", action="store_true",
                         help="Keep LoRA adapter separate (do not merge into base)")
+    parser.add_argument("--base-model", default=None,
+                        help="Override compact checkpoint base_model_path")
     args = parser.parse_args()
-    merge_fsdp_checkpoint(args.actor_dir, args.output_dir, merge_lora=not args.no_merge_lora)
+    merge_fsdp_checkpoint(
+        args.actor_dir,
+        args.output_dir,
+        merge_lora=not args.no_merge_lora,
+        base_model_override=args.base_model,
+    )

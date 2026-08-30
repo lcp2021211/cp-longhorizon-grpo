@@ -141,6 +141,48 @@ class BaseCheckpointManager:
                 continue
             shutil.rmtree(abs_path, ignore_errors=True)
 
+    def restore_checkpoint_history(self, local_path: str) -> None:
+        """Recover retained checkpoint paths after a trainer process restart.
+
+        In-memory rotation history is otherwise empty after resume, allowing old
+        checkpoints to accumulate beyond ``max_ckpt_to_keep``.  Both
+        ``.../global_step_N`` and ``.../global_step_N/actor`` layouts are
+        supported.
+        """
+
+        if self.previous_saved_paths or not local_path:
+            return
+        absolute_path = os.path.abspath(local_path)
+        basename = os.path.basename(absolute_path)
+        parent = os.path.dirname(absolute_path)
+        parent_basename = os.path.basename(parent)
+        if basename.startswith("global_step_"):
+            checkpoint_root = parent
+            component = None
+        elif parent_basename.startswith("global_step_"):
+            checkpoint_root = os.path.dirname(parent)
+            component = basename
+        else:
+            return
+
+        discovered = []
+        try:
+            entries = os.scandir(checkpoint_root)
+        except FileNotFoundError:
+            return
+        with entries:
+            for entry in entries:
+                if not entry.is_dir() or not entry.name.startswith("global_step_"):
+                    continue
+                try:
+                    step = int(entry.name.removeprefix("global_step_"))
+                except ValueError:
+                    continue
+                candidate = entry.path if component is None else os.path.join(entry.path, component)
+                if os.path.isdir(candidate) and os.path.abspath(candidate) != absolute_path:
+                    discovered.append((step, os.path.abspath(candidate)))
+        self.previous_saved_paths = [path for _, path in sorted(discovered)]
+
     def ensure_checkpoint_capacity(self, max_ckpt_to_keep: int):
         """
         Remove old checkpoints to make room for a new one, keeping a safety buffer.
