@@ -110,6 +110,32 @@ class AgentData:
         self.extra_fields: dict[str, Any] = {}
 
 
+def merge_leading_system_messages(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Merge leading system messages for templates that allow only one.
+
+    The dataset supplies global context while an interaction supplies a domain
+    policy. Qwen3.5 accepts both, but requires one system message at index zero.
+    """
+    copied = [dict(message) for message in messages]
+    leading_count = 0
+    while (
+        leading_count < len(copied)
+        and copied[leading_count].get("role") == "system"
+    ):
+        leading_count += 1
+    if leading_count <= 1:
+        return copied
+
+    contents = [message.get("content", "") for message in copied[:leading_count]]
+    if not all(isinstance(content, str) for content in contents):
+        raise TypeError("Leading system message content must be text before merging")
+    merged = dict(copied[0])
+    merged["content"] = "\n\n".join(content for content in contents if content)
+    return [merged, *copied[leading_count:]]
+
+
 @register("tool_agent")
 class ToolAgentLoop(AgentLoopBase):
     def __init__(self, *args, **kwargs):
@@ -171,7 +197,7 @@ class ToolAgentLoop(AgentLoopBase):
             # policy's first generation through this optional interaction hook.
             if hasattr(interaction, "get_initial_messages"):
                 initial_messages = await interaction.get_initial_messages(request_id)
-                messages.extend(initial_messages)
+                messages = merge_leading_system_messages(messages + initial_messages)
         # Create AgentData instance to encapsulate all state
         agent_data = AgentData(
             messages=messages,

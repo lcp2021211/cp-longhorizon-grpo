@@ -258,6 +258,13 @@ class MatrixValidationTests(unittest.TestCase):
 
 
 class SelectionTests(unittest.TestCase):
+    def test_runtime_dependency_preflight_reports_install_command(self):
+        with mock.patch.object(runner.importlib.util, "find_spec", return_value=None):
+            with self.assertRaisesRegex(
+                runner.RunnerError, r"qwen-vl-utils==0\.0\.14"
+            ):
+                runner.validate_runtime_dependencies()
+
     def setUp(self):
         self.matrix = {
             "a": {},
@@ -408,6 +415,64 @@ class ManifestIdentityTests(Tau2IdentityTestCase):
                 )
             self.assertEqual(len(model_hashes), 3)
             self.assertIs(identity["actor"], identity["reference"])
+
+    def test_persistent_model_cache_avoids_hashing_across_independent_calls(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = make_paths(Path(temp_dir))
+            model_dir = paths.project_dir / "experiments" / "default_model"
+            original_hash = runner.sha256_file
+            model_hashes: list[Path] = []
+
+            def counting_hash(path: Path) -> str:
+                if model_dir in path.parents:
+                    model_hashes.append(path)
+                return original_hash(path)
+
+            with mock.patch.object(runner, "sha256_file", side_effect=counting_hash):
+                first = runner.build_models_identity(
+                    str(model_dir),
+                    str(model_dir),
+                    project_dir=paths.project_dir,
+                    persistent_cache_path=paths.model_hash_cache_path,
+                )
+                second = runner.build_models_identity(
+                    str(model_dir),
+                    str(model_dir),
+                    project_dir=paths.project_dir,
+                    persistent_cache_path=paths.model_hash_cache_path,
+                )
+
+            self.assertEqual(len(model_hashes), 3)
+            self.assertEqual(first, second)
+            self.assertTrue(paths.model_hash_cache_path.is_file())
+
+    def test_model_cache_invalidates_same_size_weight_replacement(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = make_paths(Path(temp_dir))
+            model_dir = paths.project_dir / "experiments" / "default_model"
+            weight_path = model_dir / "model.safetensors"
+            original_hash = runner.sha256_file
+            model_hashes: list[Path] = []
+
+            def counting_hash(path: Path) -> str:
+                if model_dir in path.parents:
+                    model_hashes.append(path)
+                return original_hash(path)
+
+            with mock.patch.object(runner, "sha256_file", side_effect=counting_hash):
+                first = runner.build_models_identity(
+                    str(model_dir), str(model_dir), project_dir=paths.project_dir
+                )
+                weight_path.write_bytes(b"default-weight-v2")
+                second = runner.build_models_identity(
+                    str(model_dir), str(model_dir), project_dir=paths.project_dir
+                )
+
+            self.assertEqual(len(model_hashes), 6)
+            self.assertNotEqual(
+                first["actor"]["local_content_sha256"],
+                second["actor"]["local_content_sha256"],
+            )
 
     def test_huggingface_identifier_explicitly_has_no_local_content_hash(self):
         identity = runner.build_models_identity(
@@ -734,6 +799,7 @@ class CommandTests(Tau2IdentityTestCase):
             self.assertFalse(paths.train_data_path.exists())
             self.assertFalse(paths.val_data_path.exists())
             self.assertFalse(paths.ablation_root.exists())
+            self.assertFalse(paths.model_hash_cache_path.exists())
             self.assertFalse(
                 (paths.ablation_root / "e000" / runner.MANIFEST_FILENAME).exists()
             )
@@ -794,6 +860,40 @@ for output in (args.output_train, args.output_val):
                 )
             self.assertEqual(counter_path.read_text(encoding="utf-8"), "1")
             self.assertIn("Reusing existing", output.getvalue())
+
+    def test_plan_and_prelaunch_hash_unchanged_model_only_once(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = make_paths(Path(temp_dir))
+            paths.train_data_path.parent.mkdir(parents=True)
+            paths.train_data_path.write_text("data", encoding="utf-8")
+            paths.val_data_path.write_text("data", encoding="utf-8")
+            model_dir = paths.project_dir / "experiments" / "default_model"
+            original_hash = runner.sha256_file
+            model_hashes: list[Path] = []
+
+            def counting_hash(path: Path) -> str:
+                if model_dir in path.parents:
+                    model_hashes.append(path)
+                return original_hash(path)
+
+            output = io.StringIO()
+            error = io.StringIO()
+            with mock.patch.object(
+                runner, "sha256_file", side_effect=counting_hash
+            ), mock.patch.object(
+                runner, "run_streaming_command", return_value=0
+            ) as stream:
+                return_code = runner.main(
+                    ["--experiments", "e111", "--steps", "1"],
+                    paths=paths,
+                    python_executable="python-test",
+                    output=output,
+                    error=error,
+                )
+
+            self.assertEqual(return_code, 0, error.getvalue())
+            self.assertEqual(len(model_hashes), 3)
+            stream.assert_called_once()
 
     def test_identity_drift_after_planning_is_rejected_before_subprocess(self):
         with tempfile.TemporaryDirectory() as temp_dir:
