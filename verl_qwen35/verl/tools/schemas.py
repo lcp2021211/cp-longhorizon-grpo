@@ -31,7 +31,10 @@ class OpenAIFunctionParametersSchema(BaseModel):
 
     type: str
     properties: dict[str, OpenAIFunctionPropertySchema]
-    required: list[str]
+    # JSON Schema permits omitting ``required`` when every property is
+    # optional (including functions with no parameters). Some tool-schema
+    # producers, such as tau2, therefore leave it out for no-argument tools.
+    required: list[str] = Field(default_factory=list)
 
 
 class OpenAIFunctionSchema(BaseModel):

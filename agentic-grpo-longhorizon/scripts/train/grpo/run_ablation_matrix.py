@@ -33,6 +33,11 @@ TRAIN_CONFIG_NAME = "agentic_ablation_tau2"
 COMPONENT_FIELDS = ("salt_enabled", "progpo_enabled", "lata_enabled")
 MANIFEST_FILENAME = "run_manifest.json"
 MANIFEST_SCHEMA = "agentic-ablation-run/v2"
+MODEL_HASH_CACHE_SCHEMA = "agentic-model-content-cache/v1"
+MODEL_HASH_CACHE_FILENAME = "model_content_sha256_v1.json"
+REQUIRED_RUNTIME_MODULES = (
+    ("qwen_vl_utils", "qwen-vl-utils==0.0.14"),
+)
 PINNED_TAU2_COMMIT = "c3398666e6559e3a063da3fc04b5acf7f941464e"
 STATIC_IDENTITY_FIELDS = (
     "schema",
@@ -72,7 +77,11 @@ IMPLEMENTATION_PATHS = (
     ("tau2_context", "project", "src/envs/tau_bench_context.py"),
     ("tau2_interaction", "project", "src/envs/tau_bench_interaction.py"),
     ("tau2_tools", "project", "src/envs/tau_bench_tools.py"),
-    ("salt_trace", "repository", "verl_qwen35/verl/experimental/agent_loop/salt_trace.py"),
+    (
+        "salt_trace",
+        "repository",
+        "verl_qwen35/verl/experimental/agent_loop/salt_trace.py",
+    ),
     (
         "tool_agent_loop",
         "repository",
@@ -82,6 +91,11 @@ IMPLEMENTATION_PATHS = (
     ("ray_trainer", "repository", "verl_qwen35/verl/trainer/ppo/ray_trainer.py"),
     ("main_ppo", "repository", "verl_qwen35/verl/trainer/main_ppo.py"),
     ("fsdp_workers", "repository", "verl_qwen35/verl/workers/fsdp_workers.py"),
+    (
+        "qwen35_transformers",
+        "repository",
+        "verl_qwen35/verl/models/transformers/qwen3_5.py",
+    ),
     (
         "compact_lora_checkpoint",
         "repository",
@@ -127,6 +141,7 @@ class RunnerPaths:
     train_data_path: Path
     val_data_path: Path
     ablation_root: Path
+    model_hash_cache_path: Path
 
     @classmethod
     def for_project(cls, project_dir: Path) -> "RunnerPaths":
@@ -148,6 +163,12 @@ class RunnerPaths:
             train_data_path=project_dir / "experiments" / "tau2" / "train.parquet",
             val_data_path=project_dir / "experiments" / "tau2" / "val.parquet",
             ablation_root=project_dir / "experiments" / "ablations",
+            model_hash_cache_path=(
+                project_dir
+                / "experiments"
+                / ".identity_cache"
+                / MODEL_HASH_CACHE_FILENAME
+            ),
         )
 
 
@@ -349,6 +370,137 @@ def build_content_manifest(
     }
 
 
+def _model_content_metadata(root: Path) -> dict[str, Any]:
+    """Collect a fast, content-free fingerprint for a local model tree."""
+    candidates: list[tuple[Path, Path]] = []
+    if root.is_file():
+        candidates.append((Path(root.name), root))
+    elif root.is_dir():
+        for directory, directory_names, filenames in os.walk(root, followlinks=False):
+            directory_names[:] = sorted(
+                name
+                for name in directory_names
+                if name.lower() not in EXCLUDED_TREE_DIRECTORIES
+            )
+            directory_path = Path(directory)
+            for filename in sorted(filenames):
+                path = directory_path / filename
+                relative = path.relative_to(root)
+                if _tree_path_is_excluded(relative) or not path.is_file():
+                    continue
+                candidates.append((relative, path))
+    else:
+        raise RunnerError(f"Content identity root is not a file/directory: {root}")
+
+    files: list[dict[str, Any]] = []
+    for relative, path in sorted(candidates, key=lambda item: item[0].as_posix()):
+        try:
+            stat_result = path.stat()
+            link_target = os.readlink(path) if path.is_symlink() else None
+        except OSError as exc:
+            raise RunnerError(
+                f"Cannot stat model identity input {path}: {exc}"
+            ) from exc
+        files.append(
+            {
+                "path": relative.as_posix(),
+                "size": stat_result.st_size,
+                "mtime_ns": stat_result.st_mtime_ns,
+                "ctime_ns": stat_result.st_ctime_ns,
+                "device": stat_result.st_dev,
+                "inode": stat_result.st_ino,
+                "link_target": link_target,
+            }
+        )
+    return {"file_count": len(files), "files": files}
+
+
+def _empty_model_hash_cache() -> dict[str, Any]:
+    return {"schema": MODEL_HASH_CACHE_SCHEMA, "entries": {}}
+
+
+def _load_model_hash_cache(path: Path) -> dict[str, Any]:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            loaded = json.load(handle)
+    except FileNotFoundError:
+        return _empty_model_hash_cache()
+    except (OSError, json.JSONDecodeError):
+        # A cache is only an optimization. Never trust or block on a corrupt one.
+        return _empty_model_hash_cache()
+    if (
+        not isinstance(loaded, dict)
+        or loaded.get("schema") != MODEL_HASH_CACHE_SCHEMA
+        or not isinstance(loaded.get("entries"), dict)
+    ):
+        return _empty_model_hash_cache()
+    return loaded
+
+
+def _validated_cached_model_identity(
+    cache: Mapping[str, Any], effective_path: str, metadata: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    entries = cache.get("entries")
+    if not isinstance(entries, dict):
+        return None
+    entry = entries.get(effective_path)
+    if not isinstance(entry, dict) or entry.get("metadata") != metadata:
+        return None
+    identity = entry.get("identity")
+    if (
+        not isinstance(identity, dict)
+        or identity.get("effective_path") != effective_path
+    ):
+        return None
+    content = identity.get("local_content")
+    if not isinstance(content, dict) or not isinstance(content.get("files"), list):
+        return None
+
+    metadata_files = metadata.get("files")
+    if not isinstance(metadata_files, list):
+        return None
+    expected_path_sizes = [
+        {"path": item.get("path"), "size": item.get("size")}
+        for item in metadata_files
+        if isinstance(item, dict)
+    ]
+    cached_path_sizes: list[dict[str, Any]] = []
+    for item in content["files"]:
+        if not isinstance(item, dict) or set(item) != {"path", "size", "sha256"}:
+            return None
+        digest = item.get("sha256")
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            return None
+        cached_path_sizes.append({"path": item.get("path"), "size": item.get("size")})
+    if cached_path_sizes != expected_path_sizes:
+        return None
+
+    canonical = json.dumps(
+        content["files"], ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    tree_sha256 = hashlib.sha256(canonical).hexdigest()
+    if (
+        content.get("state") != "present"
+        or content.get("file_count") != len(content["files"])
+        or content.get("tree_sha256") != tree_sha256
+        or identity.get("local_content_sha256") != tree_sha256
+    ):
+        return None
+    return identity
+
+
+def _store_model_hash_cache_entry(
+    cache_path: Path,
+    effective_path: str,
+    metadata: Mapping[str, Any],
+    identity: Mapping[str, Any],
+) -> None:
+    cache = _load_model_hash_cache(cache_path)
+    entries = cache["entries"]
+    entries[effective_path] = {"metadata": metadata, "identity": identity}
+    atomic_write_manifest(cache_path, cache)
+
+
 def normalize_model_reference(value: str, project_dir: Path) -> str:
     """Return the path/identifier that is effectively used from project cwd."""
     expanded = Path(value).expanduser()
@@ -367,6 +519,8 @@ def _model_identity(
     project_dir: Path,
     *,
     file_hash_cache: MutableMapping[str, str] | None = None,
+    persistent_cache_path: Path | None = None,
+    persist_cache: bool = True,
 ) -> dict[str, Any]:
     effective = normalize_model_reference(reference, project_dir)
     path = Path(effective)
@@ -385,17 +539,37 @@ def _model_identity(
         )
     if not (path.is_dir() or path.is_file()):
         raise RunnerError(f"Local model path is not a file/directory: {path}")
-    content = build_content_manifest(path, file_hash_cache=file_hash_cache)
-    if content["file_count"] == 0:
+
+    metadata_before = _model_content_metadata(path)
+    if metadata_before["file_count"] == 0:
         raise RunnerError(
             f"Local model path contains no identity-bearing files: {path}"
         )
-    return {
+    cache_path = persistent_cache_path or (
+        project_dir / "experiments" / ".identity_cache" / MODEL_HASH_CACHE_FILENAME
+    )
+    cached_identity = _validated_cached_model_identity(
+        _load_model_hash_cache(cache_path), effective, metadata_before
+    )
+    if cached_identity is not None:
+        return cached_identity
+
+    content = build_content_manifest(path, file_hash_cache=file_hash_cache)
+    metadata_after = _model_content_metadata(path)
+    if metadata_after != metadata_before:
+        raise RunnerError(
+            f"Local model changed while its content was being hashed: {path}. "
+            "Retry after the model files are stable."
+        )
+    identity = {
         "kind": "local_directory" if path.is_dir() else "local_file",
         "effective_path": effective,
         "local_content": content,
         "local_content_sha256": content["tree_sha256"],
     }
+    if persist_cache:
+        _store_model_hash_cache_entry(cache_path, effective, metadata_after, identity)
+    return identity
 
 
 def build_models_identity(
@@ -404,6 +578,8 @@ def build_models_identity(
     *,
     project_dir: Path,
     model_identity_cache: MutableMapping[str, dict[str, Any]] | None = None,
+    persistent_cache_path: Path | None = None,
+    persist_cache: bool = True,
 ) -> dict[str, Any]:
     """Build actor/ref identity, hashing an identical local model only once."""
     identities = model_identity_cache if model_identity_cache is not None else {}
@@ -416,6 +592,8 @@ def build_models_identity(
                 effective,
                 project_dir,
                 file_hash_cache=file_hash_cache,
+                persistent_cache_path=persistent_cache_path,
+                persist_cache=persist_cache,
             )
         return identities[effective]
 
@@ -806,6 +984,7 @@ def build_run_identity(
     include_datasets: bool,
     training_config: Mapping[str, Any] | None = None,
     model_identity_cache: MutableMapping[str, dict[str, Any]] | None = None,
+    persist_model_cache: bool = True,
 ) -> dict[str, Any]:
     """Build the immutable identity used to guard checkpoint resumption.
 
@@ -826,6 +1005,8 @@ def build_run_identity(
             reference_model,
             project_dir=paths.project_dir,
             model_identity_cache=model_identity_cache,
+            persistent_cache_path=paths.model_hash_cache_path,
+            persist_cache=persist_model_cache,
         ),
         "training_config": {
             "effective_path": str(paths.train_config_path.resolve(strict=False)),
@@ -862,6 +1043,7 @@ def build_current_plan_identity(
     model_override: str | None,
     include_datasets: bool,
     model_identity_cache: MutableMapping[str, dict[str, Any]] | None = None,
+    persist_model_cache: bool = True,
 ) -> tuple[dict[str, Any], str, str]:
     """Reload config and construct identity from the state that exists now."""
     training_config = _load_yaml_mapping(paths.train_config_path, "Training config")
@@ -880,6 +1062,7 @@ def build_current_plan_identity(
             include_datasets=include_datasets,
             training_config=training_config,
             model_identity_cache=model_identity_cache,
+            persist_model_cache=persist_model_cache,
         ),
         actor_model,
         reference_model,
@@ -1239,6 +1422,22 @@ def run_simple_command(command: Sequence[str], *, cwd: Path) -> int:
         ) from exc
 
 
+def validate_runtime_dependencies() -> None:
+    """Fail before model loading when an agent-loop runtime module is absent."""
+    missing = [
+        requirement
+        for module, requirement in REQUIRED_RUNTIME_MODULES
+        if importlib.util.find_spec(module) is None
+    ]
+    if missing:
+        requirements = " ".join(missing)
+        raise RunnerError(
+            "Missing training runtime dependencies: "
+            f"{requirements}. Install them in the active environment with "
+            f"`python -m pip install {requirements}`."
+        )
+
+
 def _positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
@@ -1371,6 +1570,8 @@ def execute(
         print_matrix(matrix, output)
         return 0
 
+    validate_runtime_dependencies()
+
     defaults = load_training_defaults(paths.train_config_path)
     target_steps = args.steps or defaults.total_steps
     selected = parse_experiment_selection(args.experiments, matrix)
@@ -1422,6 +1623,7 @@ def execute(
                 model_override=args.model_path,
                 include_datasets=datasets_available,
                 model_identity_cache=shared_model_identity_cache,
+                persist_model_cache=not args.dry_run,
             )
             identity_status = validate_or_create_manifest(
                 plan,
@@ -1479,10 +1681,11 @@ def execute(
         output.write(f"[train] {plan.experiment_id}: {plan.reason}; log={log_path}\n")
         output.flush()
         try:
-            # This deliberately bypasses the planning cache and re-hashes all
-            # identity-bearing inputs at the last possible point before Popen.
-            # It closes the plan/launch window for model, config, code, tau2,
-            # dataset, and simulator-routing changes.
+            # Rebuild identity at the last possible point before Popen. Local
+            # models use the persistent content hash only when their complete
+            # metadata fingerprint is unchanged, so this is a fast pre-launch
+            # check without rereading weight bytes. Other, small identity inputs
+            # are re-hashed to close the plan/launch drift window.
             launch_identity, _, _ = build_current_plan_identity(
                 paths,
                 plan,

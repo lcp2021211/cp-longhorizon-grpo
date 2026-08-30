@@ -18,6 +18,8 @@ data:
   max_response_length: 12288
   return_raw_chat: true
   tool_config_path: configs/tool_config/tau_bench_airline_tools.yaml
+  # Keep DataLoader subprocesses out of the already process-heavy Ray/vLLM job.
+  dataloader_num_workers: 0
   seed: 42
 
 actor_rollout_ref:
@@ -70,6 +72,8 @@ actor_rollout_ref:
     mode: async
     agent:
       default_agent_loop: tool_agent
+      # Match the two concurrent sequences served by the external user simulator.
+      num_workers: 2
     multi_turn:
       enable: true
       format: hermes
@@ -95,6 +99,10 @@ actor_rollout_ref:
     max_model_len: 24576
     max_num_batched_tokens: 24576
     log_prob_micro_batch_size_per_gpu: 1
+    # Load the frozen base before vLLM installs its LoRA wrappers. Runtime
+    # full-weight sync from a dummy model misses Qwen3.5 GDN Conv1d weights;
+    # after this one-time read, veRL synchronizes only the trainable LoRA state.
+    load_format: safetensors
     engine_kwargs:
       vllm:
         # Skip the unused Qwen3.5 vision encoder during text rollout.
@@ -141,6 +149,11 @@ algorithm:
     enable: true
     alpha: 1.05
 
+# Two CPU reward workers avoid multiplying process/thread pools; excess work queues.
+reward:
+  num_workers: 2
+
+
 trainer:
   total_epochs: 50
   total_training_steps: 300
@@ -163,3 +176,12 @@ trainer:
 ray_kwargs:
   ray_init:
     num_cpus: 8
+    runtime_env:
+      env_vars:
+        # Prevent every Ray actor from creating a machine-sized thread pool.
+        TOKENIZERS_PARALLELISM: "false"
+        RAYON_NUM_THREADS: "1"
+        OMP_NUM_THREADS: "1"
+        MKL_NUM_THREADS: "1"
+        OPENBLAS_NUM_THREADS: "1"
+        NUMEXPR_NUM_THREADS: "1"
