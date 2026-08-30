@@ -206,6 +206,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         self.previous_global_step = global_step
 
         if self.rank == 0:
+            self.restore_checkpoint_history(local_path)
             self.ensure_checkpoint_capacity(max_ckpt_to_keep)
 
         local_path = local_mkdir_safe(local_path)

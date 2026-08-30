@@ -118,7 +118,7 @@ cd /absolute/path/to/agentic-grpo-longhorizon
 
 # 同时下载本地 72B-AWQ user simulator；若使用远程 API，可不设此变量。
 DOWNLOAD_USER_SIMULATOR=1 bash setup.sh
-conda activate agentrl
+conda activate agentrl-qwen35
 ```
 
 安装后检查：
@@ -329,7 +329,7 @@ trainer:
 - experiment ID 与 SALT/ProGPO/LATA 三个开关；
 - actor/ref 的有效模型路径；本地模型会对目录中所有非缓存/非临时 regular files 建立排序后的 path、size 和 SHA256 清单；
 - 公共训练 YAML、data/rollout tool config 与 interaction config；
-- ProGPO、tau2 adapter/context/interaction/tools、SALT trace、ToolAgentLoop、`core_algos.py` 和 `ray_trainer.py` 等关键实现文件；
+- ProGPO、tau2 adapter/context/interaction/tools、SALT trace、ToolAgentLoop、`core_algos.py`、`ray_trainer.py`、`main_ppo.py`、`fsdp_workers.py` 和紧凑 checkpoint helper 等关键实现文件；
 - tau2 checkout 路径、是否精确命中 setup 固定的 Git HEAD、tracked binary diff hash、airline domain content tree，以及当前 Python 实际导入的 `tau2` 是否来自该 checkout；
 - `TAU2_USER_MODEL` / `TAU2_USER_PROVIDER` / `TAU2_USER_BASE_URL` 的实际值（不记录 API key）；
 - train/val parquet 的 SHA256。
@@ -386,7 +386,9 @@ manifest 是防误续训的最低安全线，不是完整实验追踪系统。�
 
 ## 10. 导出 checkpoint 并独立评测
 
-公共配置默认 `val_before_train=false, test_freq=-1`，不会在训练中反复观察 official test。所有组完成预先约定的固定 step budget 后，先把 veRL FSDP checkpoint 合并成 Hugging Face 模型：
+公共配置默认 `val_before_train=false, test_freq=-1`，不会在训练中反复观察 official test。当前 Qwen3.5 LoRA 主训练使用紧凑 checkpoint：冻结的基础模型从 `actor_rollout_ref.model.path` 重载，每个 step 目录只保存 LoRA adapter、optimizer、scheduler/RNG 和 dataloader 状态。启动 worker 前会校验 adapter 哈希、基础模型路径和所有续训状态；校验通过后先加载 adapter，再构造 FSDP2/optimizer，因此可精确断点续训。
+
+导出脚本会自动识别完整 FSDP checkpoint 或紧凑 LoRA checkpoint。所有组完成预先约定的固定 step budget 后，合并成 Hugging Face 模型：
 
 ```bash
 cd /absolute/path/to/agentic-grpo-longhorizon/agentic-grpo-longhorizon
@@ -399,7 +401,7 @@ python scripts/test/merge_fsdp_to_hf.py \
 保持已配置的 user simulator 可用（本地方案为 8001），在另一个终端启动待评 policy：
 
 ```bash
-conda activate agentrl
+conda activate agentrl-qwen35
 cd /absolute/path/to/agentic-grpo-longhorizon/agentic-grpo-longhorizon
 
 MODEL_PATH="$PWD/experiments/ablations/111_full/hf_step_300" \

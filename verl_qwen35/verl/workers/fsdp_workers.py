@@ -16,11 +16,9 @@ The main entry point to run the PPO algorithm
 """
 
 import datetime
-import json
 import logging
 import os
 import warnings
-from dataclasses import asdict
 
 import psutil
 import torch
@@ -30,7 +28,6 @@ from codetiming import Timer
 from omegaconf import DictConfig, OmegaConf, open_dict
 from omegaconf.errors import ConfigAttributeError
 from peft import LoraConfig, TaskType, get_peft_model
-from safetensors.torch import save_file
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConfig, StateDictType
@@ -50,6 +47,7 @@ from verl.single_controller.base.decorator import Dispatch, make_nd_compute_data
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.activation_offload import enable_activation_offloading
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
+from verl.utils.checkpoint.lora_checkpoint import save_lora_adapter_checkpoint
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import (
     get_device_id,
@@ -1218,6 +1216,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # only support save and load ckpt for actor
         assert self._is_actor
 
+        save_contents = list(self.checkpoint_manager.checkpoint_save_contents)
+        compact_lora = "model" not in save_contents
+        peft_model = getattr(self, "actor_module", self.actor_module_fsdp)
+        has_lora_adapter = self._is_lora and hasattr(peft_model, "peft_config")
+        if compact_lora and not has_lora_adapter:
+            # Fail before rotating any previous checkpoint. A checkpoint with
+            # neither full model weights nor an adapter cannot be resumed.
+            raise RuntimeError(
+                "Refusing to save a checkpoint without model weights: no LoRA adapter is available"
+            )
+
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
@@ -1226,36 +1235,43 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         )
         dist.barrier()
 
-        if self._is_lora and hasattr(getattr(self, "actor_module", self.actor_module_fsdp), "peft_config"):
+        if has_lora_adapter:
+            local_error = None
             lora_save_path = os.path.join(local_path, "lora_adapter")
-            peft_model = getattr(self, "actor_module", self.actor_module_fsdp)
-            peft_config = {}
-            if dist.get_rank() == 0:
-                os.makedirs(lora_save_path, exist_ok=True)
-                peft_config = asdict(peft_model.peft_config.get("default", {}))
-                peft_config["task_type"] = peft_config["task_type"].value
-                peft_config["peft_type"] = peft_config["peft_type"].value
-                peft_config["target_modules"] = list(peft_config["target_modules"])
             try:
                 if fsdp_version(self.actor_module_fsdp) > 0:
                     self.actor_module_fsdp = self.actor_module_fsdp.to(get_device_name())
                     lora_params = layered_summon_lora_params(self.actor_module_fsdp)
                     if dist.get_rank() == 0:
-                        save_file(lora_params, os.path.join(lora_save_path, "adapter_model.safetensors"))
-                        with open(os.path.join(lora_save_path, "adapter_config.json"), "w", encoding="utf-8") as f:
-                            json.dump(peft_config, f, ensure_ascii=False, indent=4)
-            except Exception as e:
-                log_with_rank(
-                    f"Save LoRA Adapter Error ({e})", rank=dist.get_rank(), logger=logger, log_only_rank_0=True
-                )
+                        save_lora_adapter_checkpoint(
+                            actor_path=local_path,
+                            lora_params=lora_params,
+                            peft_config=peft_model.peft_config.get("default", {}),
+                            base_model_path=str(self.config.model.path),
+                            save_contents=save_contents,
+                            compact=compact_lora,
+                        )
+            except Exception as exc:
+                local_error = f"rank {dist.get_rank()}: {type(exc).__name__}: {exc}"
 
+            errors = [None] * dist.get_world_size()
+            dist.all_gather_object(errors, local_error)
+            failures = [error for error in errors if error]
+            if failures:
+                message = "Save LoRA adapter failed (" + "; ".join(failures) + ")"
+                if compact_lora:
+                    # Do not publish latest_checkpointed_iteration for an actor
+                    # checkpoint that lacks its only model delta.
+                    raise RuntimeError(message)
+                log_with_rank(message, rank=dist.get_rank(), logger=logger, log_only_rank_0=True)
+            else:
+                log_with_rank(
+                    f"[rank-{self.rank}]: Saved LoRA adapter to: {lora_save_path}",
+                    rank=dist.get_rank(),
+                    logger=logger,
+                    log_only_rank_0=True,
+                )
             dist.barrier()
-            log_with_rank(
-                f"[rank-{self.rank}]: Saved LoRA adapter to: {lora_save_path}",
-                rank=dist.get_rank(),
-                logger=logger,
-                log_only_rank_0=True,
-            )
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)

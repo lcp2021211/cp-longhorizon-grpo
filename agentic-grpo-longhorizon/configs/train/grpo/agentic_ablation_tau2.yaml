@@ -42,6 +42,12 @@ actor_rollout_ref:
     freeze_vision_tower: true
     use_torch_compile: false
     entropy_from_logits_with_chunking: true
+    # The frozen 9B base model is reloaded from model.path on resume. Persist
+    # only the changing LoRA adapter (exported by the worker), Adam state, and
+    # scheduler/RNG state. Compact-resume preflight rejects bad checkpoints.
+    checkpoint:
+      save_contents: [optimizer, extra]
+      load_contents: [optimizer, extra]
     fsdp_config:
       fsdp_size: 1
       reshard_after_forward: true
@@ -153,3 +159,7 @@ trainer:
   nnodes: 1
   # Custom SALT/ProGPO/LATA hooks live in the legacy RayPPOTrainer path.
   use_legacy_worker_impl: enable
+
+ray_kwargs:
+  ray_init:
+    num_cpus: 8
