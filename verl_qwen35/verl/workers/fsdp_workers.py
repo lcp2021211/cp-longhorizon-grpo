@@ -150,6 +150,35 @@ def get_vl_model_vision_tower(vl_model_instance):
     return None
 
 
+def _align_lora_adapter_dtype(actor_module: torch.nn.Module) -> tuple[int, torch.dtype | None]:
+    """Align trainable LoRA weights with the frozen base dtype before FSDP2 wrapping.
+
+    PEFT promotes adapter weights to fp32 by default. FSDP2 requires parameters in
+    one flat group to share a dtype, so a bf16 base with fp32 adapters otherwise
+    fails during the first post-backward reduction.
+    """
+    base_dtype = next(
+        (
+            param.dtype
+            for param in actor_module.parameters()
+            if not param.requires_grad and param.is_floating_point()
+        ),
+        None,
+    )
+    if base_dtype is None:
+        return 0, None
+
+    mismatched_params = [
+        param
+        for param in actor_module.parameters()
+        if param.requires_grad and param.is_floating_point() and param.dtype != base_dtype
+    ]
+    for param in mismatched_params:
+        param.data = param.data.to(base_dtype)
+
+    return len(mismatched_params), base_dtype
+
+
 @deprecated("legacy worker implementation is deprecated and will be removed in v0.8.0")
 class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     """
@@ -547,6 +576,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     "bias": "none",
                 }
                 actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
+
+            aligned_param_count, adapter_dtype = _align_lora_adapter_dtype(actor_module)
+            if self.rank == 0 and aligned_param_count:
+                print(
+                    f"[actor model] Cast {aligned_param_count} trainable LoRA parameters "
+                    f"to {adapter_dtype} to match the frozen base model for FSDP2."
+                )
 
         self.use_orig_params = fsdp_config.get("use_orig_params", False)
         if self.config.actor.get("freeze_vision_tower", False):
