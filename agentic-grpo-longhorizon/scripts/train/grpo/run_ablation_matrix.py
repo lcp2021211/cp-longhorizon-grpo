@@ -176,6 +176,7 @@ class RunnerPaths:
 class TrainingDefaults:
     total_steps: int
     total_epochs: int
+    rollouts_per_step: int
 
 
 @dataclass(frozen=True)
@@ -258,16 +259,33 @@ def load_and_validate_matrix(path: Path) -> dict[str, dict[str, Any]]:
 
 def load_training_defaults(path: Path) -> TrainingDefaults:
     raw = _load_yaml_mapping(path, "Training config")
+    data = raw.get("data")
+    actor_rollout_ref = raw.get("actor_rollout_ref")
     trainer = raw.get("trainer")
+    if not isinstance(data, dict):
+        raise RunnerError(f"Training config has no data mapping: {path}")
+    if not isinstance(actor_rollout_ref, dict):
+        raise RunnerError(f"Training config has no actor_rollout_ref mapping: {path}")
     if not isinstance(trainer, dict):
         raise RunnerError(f"Training config has no trainer mapping: {path}")
     steps = trainer.get("total_training_steps")
     epochs = trainer.get("total_epochs")
+    train_batch_size = data.get("train_batch_size")
+    rollout = actor_rollout_ref.get("rollout")
+    rollout_n = rollout.get("n") if isinstance(rollout, dict) else None
     if type(steps) is not int or steps <= 0:
         raise RunnerError("trainer.total_training_steps must be a positive integer")
     if type(epochs) is not int or epochs <= 0:
         raise RunnerError("trainer.total_epochs must be a positive integer")
-    return TrainingDefaults(total_steps=steps, total_epochs=epochs)
+    if type(train_batch_size) is not int or train_batch_size <= 0:
+        raise RunnerError("data.train_batch_size must be a positive integer")
+    if type(rollout_n) is not int or rollout_n <= 0:
+        raise RunnerError("actor_rollout_ref.rollout.n must be a positive integer")
+    return TrainingDefaults(
+        total_steps=steps,
+        total_epochs=epochs,
+        rollouts_per_step=train_batch_size * rollout_n,
+    )
 
 
 def sha256_file(path: Path) -> str:
@@ -1359,6 +1377,9 @@ def build_training_command(
         f"trainer.resume_mode={resume_mode}",
         f"trainer.default_local_dir={plan.checkpoint_dir}",
         f"trainer.experiment_name={plan.experiment_id}",
+        # Keep console output while also recording the trainer's existing
+        # per-step metrics locally. This changes only the logging backends.
+        "trainer.logger=[console,tensorboard]",
         f"hydra.run.dir={run_dir / 'hydra'}/${{now:%Y%m%d_%H%M%S}}",
         "hydra.job.chdir=false",
     ]
@@ -1371,10 +1392,42 @@ def format_command(command: Sequence[str]) -> str:
     return shlex.join(str(part) for part in command)
 
 
+def build_rollout_monitor_command(
+    paths: RunnerPaths,
+    *,
+    python_executable: str,
+    log_path: Path,
+    tensorboard_dir: Path,
+    rollouts_per_step: int,
+) -> list[str]:
+    return [
+        python_executable,
+        str(
+            paths.project_dir
+            / "scripts"
+            / "train"
+            / "grpo"
+            / "log_to_tensorboard.py"
+        ),
+        "--log-file",
+        str(log_path),
+        "--tensorboard-dir",
+        str(tensorboard_dir),
+        "--rollouts-per-step",
+        str(rollouts_per_step),
+    ]
+
+
 def run_streaming_command(
-    command: Sequence[str], *, cwd: Path, log_path: Path, output: TextIO = sys.stdout
+    command: Sequence[str],
+    *,
+    cwd: Path,
+    log_path: Path,
+    output: TextIO = sys.stdout,
+    env: Mapping[str, str] | None = None,
+    monitor_command: Sequence[str] | None = None,
 ) -> int:
-    """Tee combined stdout/stderr to console and a file, preserving exit code."""
+    """Tee output and reap the optional read-only log monitor with the child."""
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a", encoding="utf-8", buffering=1) as log_handle:
         header = f"\n$ {format_command(command)}\n"
@@ -1385,6 +1438,7 @@ def run_streaming_command(
             process = subprocess.Popen(
                 list(command),
                 cwd=cwd,
+                env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -1399,6 +1453,23 @@ def run_streaming_command(
             log_handle.write(message)
             return 127
 
+        monitor_process: subprocess.Popen[str] | None = None
+        if monitor_command is not None:
+            try:
+                monitor_process = subprocess.Popen(
+                    list(monitor_command),
+                    cwd=cwd,
+                    env=env,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                )
+            except OSError as exc:
+                message = f"Warning: failed to start rollout monitor: {exc}\n"
+                output.write(message)
+                output.flush()
+                log_handle.write(message)
+
         assert process.stdout is not None
         try:
             with process.stdout:
@@ -1410,6 +1481,14 @@ def run_streaming_command(
             process.terminate()
             process.wait()
             raise
+        finally:
+            if monitor_process is not None and monitor_process.poll() is None:
+                monitor_process.terminate()
+                try:
+                    monitor_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    monitor_process.kill()
+                    monitor_process.wait()
         return process.wait()
 
 
@@ -1711,8 +1790,35 @@ def execute(
             if not args.continue_on_error:
                 return 1
             continue
+        tensorboard_dir = (
+            paths.ablation_root / plan.experiment_id / "tensorboard"
+        ).resolve()
+        training_env = os.environ.copy()
+        training_env["TENSORBOARD_DIR"] = str(tensorboard_dir)
+        output.write(
+            f"[tensorboard] {plan.experiment_id}: logdir={tensorboard_dir}\n"
+            f"[tensorboard] view with: tensorboard --logdir {shlex.quote(str(tensorboard_dir))} "
+            "--host 127.0.0.1 --port 6006\n"
+        )
+        monitor_command = build_rollout_monitor_command(
+            paths,
+            python_executable=python_executable,
+            log_path=log_path,
+            tensorboard_dir=tensorboard_dir,
+            rollouts_per_step=defaults.rollouts_per_step,
+        )
+        output.write(
+            f"[rollout-monitor] {plan.experiment_id}: "
+            f"{defaults.rollouts_per_step} rollouts/step; tags=rollout_live/*\n"
+        )
+        output.flush()
         return_code = run_streaming_command(
-            command, cwd=paths.project_dir, log_path=log_path, output=output
+            command,
+            cwd=paths.project_dir,
+            log_path=log_path,
+            output=output,
+            env=training_env,
+            monitor_command=monitor_command,
         )
         if return_code != 0:
             failures += 1

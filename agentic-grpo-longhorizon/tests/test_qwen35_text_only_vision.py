@@ -8,7 +8,7 @@ from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextRotaryEmbedding
 
 from verl.models.transformers.qwen3_5 import _ensure_text_rotary_buffers_on_device, _get_input_embeds
-from verl.workers.fsdp_workers import get_vl_model_vision_tower
+from verl.workers.fsdp_workers import _align_lora_adapter_dtype, get_vl_model_vision_tower
 
 
 class _FakeVisual(torch.nn.Module):
@@ -65,6 +65,23 @@ def test_vision_tower_lookup_unwraps_peft_style_layers():
     peft_model = SimpleNamespace(model=lora_model, base_model=lora_model)
 
     assert get_vl_model_vision_tower(peft_model) is visual
+
+
+def test_lora_adapter_dtype_is_aligned_before_fsdp2_wrapping():
+    module = torch.nn.Module()
+    module.register_parameter(
+        "frozen_base", torch.nn.Parameter(torch.ones(2, dtype=torch.bfloat16), requires_grad=False)
+    )
+    module.register_parameter("lora_adapter", torch.nn.Parameter(torch.ones(2, dtype=torch.float32)))
+
+    aligned_count, target_dtype = _align_lora_adapter_dtype(module)
+
+    assert aligned_count == 1
+    assert target_dtype == torch.bfloat16
+    assert module.frozen_base.dtype == torch.bfloat16
+    assert module.frozen_base.requires_grad is False
+    assert module.lora_adapter.dtype == torch.bfloat16
+    assert module.lora_adapter.requires_grad is True
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA to reproduce CPU-offloaded RoPE buffers")
