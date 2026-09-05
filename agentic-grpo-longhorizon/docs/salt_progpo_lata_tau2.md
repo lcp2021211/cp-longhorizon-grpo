@@ -108,5 +108,3 @@ bash agentic-grpo-longhorizon/scripts/train/grpo/run_salt_progpo_lata_tau2.sh
 健康检查：如果进入 mixed-outcome 阶段后，`salt/merge_rate` 连续多个 update 仍接近 0，那么当前 canonical-exact matcher 实际上没有提供细粒度修正；此时应先检查 trace，再把 embedding matcher 作为独立消融，而不是把零合并结果解释成 SALT 的效果。
 
 当前提交提供算法、rollout metadata、训练配置、诊断和单元测试；它没有虚构新的训练收益。最终效果仍需完成 7B GPU 训练和独立 pass@k 评测后报告。
-
-参考：SALT 论文与附录算法 <https://aclanthology.org/2026.findings-eacl.247/>。
