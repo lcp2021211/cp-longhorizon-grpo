@@ -47,11 +47,13 @@ def make_paths(root: Path, matrix_text: str = VALID_MATRIX) -> runner.RunnerPath
     matrix.write_text(matrix_text, encoding="utf-8")
     config.write_text(
         """data:
+  train_batch_size: 4
   tool_config_path: configs/tool_config/tools.yaml
 actor_rollout_ref:
   model:
     path: experiments/default_model
   rollout:
+    n: 8
     multi_turn:
       tool_config_path: configs/tool_config/tools.yaml
       interaction_config_path: configs/interaction_config/interaction.yaml
@@ -769,6 +771,7 @@ class CommandTests(Tau2IdentityTestCase):
             self.assertIn("trainer.total_training_steps=12", command)
             self.assertIn("trainer.total_epochs=12", command)
             self.assertIn(f"trainer.default_local_dir={checkpoint_dir}", command)
+            self.assertIn("trainer.logger=[console,tensorboard]", command)
             self.assertIn("actor_rollout_ref.model.path=/models/policy", command)
             self.assertNotIn("actor_rollout_ref.ref.model.path=", command)
             self.assertIn("hydra.job.chdir=false", command)
@@ -894,6 +897,11 @@ for output in (args.output_train, args.output_val):
             self.assertEqual(return_code, 0, error.getvalue())
             self.assertEqual(len(model_hashes), 3)
             stream.assert_called_once()
+            self.assertEqual(
+                stream.call_args.kwargs["env"]["TENSORBOARD_DIR"],
+                str((paths.ablation_root / "e111" / "tensorboard").resolve()),
+            )
+            self.assertIn("[tensorboard] e111: logdir=", output.getvalue())
 
     def test_identity_drift_after_planning_is_rejected_before_subprocess(self):
         with tempfile.TemporaryDirectory() as temp_dir:

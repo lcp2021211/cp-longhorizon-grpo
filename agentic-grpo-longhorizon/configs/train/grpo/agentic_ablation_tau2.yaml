@@ -17,6 +17,10 @@ data:
   max_prompt_length: 8192
   max_response_length: 12288
   return_raw_chat: true
+  # Qwen3.5 policy uses the non-thinking chat-template branch. This keeps the
+  # tool-agent protocol unchanged while avoiding long hidden reasoning traces.
+  apply_chat_template_kwargs:
+    enable_thinking: false
   tool_config_path: configs/tool_config/tau_bench_airline_tools.yaml
   # Keep DataLoader subprocesses out of the already process-heavy Ray/vLLM job.
   dataloader_num_workers: 0
@@ -52,10 +56,10 @@ actor_rollout_ref:
       load_contents: [optimizer, extra]
     fsdp_config:
       fsdp_size: 1
-      reshard_after_forward: true
-      offload_policy: true
-      optimizer_offload: true
-      param_offload: true
+      reshard_after_forward: false
+      offload_policy: false
+      optimizer_offload: false
+      param_offload: false
       entropy_checkpointing: true
       model_dtype: bf16
       dtype: bfloat16
@@ -76,10 +80,12 @@ actor_rollout_ref:
       num_workers: 2
     multi_turn:
       enable: true
-      format: hermes
+      format: qwen3_coder
       max_user_turns: 15
       max_assistant_turns: 15
       max_parallel_calls: 1
+      # Character limit applied to each tool response by ToolAgentLoop.
+      max_tool_response_length: 2048
       tool_config_path: configs/tool_config/tau_bench_airline_tools.yaml
       interaction_config_path: configs/interaction_config/tau2_airline_progpo.yaml
     # Fixed for every variant. SALT paper default group size is 8.
@@ -88,14 +94,14 @@ actor_rollout_ref:
     top_p: 0.9
     tensor_model_parallel_size: 1
     calculate_log_probs: true
-    gpu_memory_utilization: 0.45
+    gpu_memory_utilization: 0.55
     # Eager mode avoids a persistent CUDA-graph allocation in the hybrid
     # one-GPU actor/rollout process and is safer for the first smoke run.
     enforce_eager: true
     free_cache_engine: true
     enable_chunked_prefill: true
     enable_prefix_caching: false
-    max_num_seqs: 8
+    max_num_seqs: 16
     max_model_len: 24576
     max_num_batched_tokens: 24576
     log_prob_micro_batch_size_per_gpu: 1
@@ -157,7 +163,7 @@ reward:
 trainer:
   total_epochs: 50
   total_training_steps: 300
-  save_freq: 50
+  save_freq: 10
   max_actor_ckpt_to_keep: 2
   # Do not repeatedly observe the official held-out test split while training.
   val_before_train: false
