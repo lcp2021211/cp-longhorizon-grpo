@@ -118,7 +118,7 @@ cd /absolute/path/to/agentic-grpo-longhorizon
 
 # 同时下载本地 72B-AWQ user simulator；若使用远程 API，可不设此变量。
 DOWNLOAD_USER_SIMULATOR=1 bash setup.sh
-conda activate agentrl
+conda activate agentrl-qwen35
 ```
 
 安装后检查：
@@ -306,21 +306,43 @@ experiments/ablations/<variant>/
   run_manifest.json
   checkpoints/
   logs/training_<timestamp>.log
+  tensorboard/events.out.tfevents.*
   hydra/<timestamp>/
 ```
 
 runner 默认顺序执行并在任一训练失败后停止；`--continue-on-error` 可记录失败并继续后续组。不要让多个进程同时写同一个 variant 目录。八组顺序训练约等于完整方案八倍的训练预算；只有资源和 simulator endpoint 相互隔离时才应并行。
 
-### 7.4 本地日志与 SwanLab
+### 7.4 本地日志与 TensorBoard
 
-默认配置只启用本地 `console`，不要求 SwanLab 登录：
+runner 会保留终端 `console` 输出，并额外启用本地 TensorBoard；不需要联网或登录。每组实验的事件文件保存在：
 
-```yaml
-trainer:
-  logger: [console]
+```text
+experiments/ablations/<variant>/tensorboard/
 ```
 
-需要 SwanLab 时，可以统一改为 `[console, swanlab]` 并提前完成登录。八组必须采用同样的日志设置；日志后端不应改变训练超参。
+训练开始后，在另一个终端启动 TensorBoard：
+
+```bash
+cd /absolute/path/to/agentic-grpo-longhorizon/agentic-grpo-longhorizon
+tensorboard \
+  --logdir experiments/ablations/111_full/tensorboard \
+  --host 127.0.0.1 \
+  --port 6006
+```
+
+同一台机器上访问 `http://127.0.0.1:6006`。从本地电脑查看远程服务器时，再建立 SSH 端口转发：
+
+```bash
+ssh -N -L 6006:127.0.0.1:6006 USER@SERVER
+```
+
+runner 还会随训练自动启动独立的只读 `日志 -> TensorBoard` 监控器。它不访问训练进程、模型或 checkpoint，只读取该次 `logs/training_*.log`，并把事件写进同一个 TensorBoard 目录；训练退出或被 `Ctrl-C` 停止时，runner 会自动回收监控进程。
+
+训练刚启动时即可看到 `rollout_live/completed=0`、`rollout_live/total=32`、`rollout_live/progress_percent` 和 `rollout_live/training_step`。每条 tau2 rollout 输出 `Evaluation result: reward=...` 后，会立即刷新 `rollout_live/reward_latest`、`rollout_live/reward_running_mean`、`rollout_live/{reward_min,reward_max,success_rate}`；`rollout_live/elapsed_minutes` 每 15 秒刷新一次，所以即使首条 rollout 尚未完成，也能确认监控仍在运行。
+
+veRL 原生指标仍以完整训练 step 为横轴，需要全部 rollout 和优化更新完成后才出现。重点查看 `critic/score/mean`（原始 trajectory reward）、`critic/score/{max,min,std,all_zero_frac,all_one_frac}`、`critic/rewards/mean`、`actor/{pg_loss,kl_loss,grad_norm}`，以及 `timing_s/*`、`perf/*` 等性能指标。两个日志后端都只消费已有日志/指标，不改变训练数据、超参、采样、reward 或优化更新。
+
+如需 SwanLab，可以另行把 logger 后端扩展为 `swanlab` 并提前完成登录；公平消融时各组应采用相同日志设置。
 
 ## 8. Resume 与重新开始
 
@@ -329,7 +351,7 @@ trainer:
 - experiment ID 与 SALT/ProGPO/LATA 三个开关；
 - actor/ref 的有效模型路径；本地模型会对目录中所有非缓存/非临时 regular files 建立排序后的 path、size 和 SHA256 清单；
 - 公共训练 YAML、data/rollout tool config 与 interaction config；
-- ProGPO、tau2 adapter/context/interaction/tools、SALT trace、ToolAgentLoop、`core_algos.py` 和 `ray_trainer.py` 等关键实现文件；
+- ProGPO、tau2 adapter/context/interaction/tools、SALT trace、ToolAgentLoop、`core_algos.py`、`ray_trainer.py`、`main_ppo.py`、`fsdp_workers.py` 和紧凑 checkpoint helper 等关键实现文件；
 - tau2 checkout 路径、是否精确命中 setup 固定的 Git HEAD、tracked binary diff hash、airline domain content tree，以及当前 Python 实际导入的 `tau2` 是否来自该 checkout；
 - `TAU2_USER_MODEL` / `TAU2_USER_PROVIDER` / `TAU2_USER_BASE_URL` 的实际值（不记录 API key）；
 - train/val parquet 的 SHA256。
@@ -386,7 +408,9 @@ manifest 是防误续训的最低安全线，不是完整实验追踪系统。�
 
 ## 10. 导出 checkpoint 并独立评测
 
-公共配置默认 `val_before_train=false, test_freq=-1`，不会在训练中反复观察 official test。所有组完成预先约定的固定 step budget 后，先把 veRL FSDP checkpoint 合并成 Hugging Face 模型：
+公共配置默认 `val_before_train=false, test_freq=-1`，不会在训练中反复观察 official test。当前 Qwen3.5 LoRA 主训练使用紧凑 checkpoint：冻结的基础模型从 `actor_rollout_ref.model.path` 重载，每个 step 目录只保存 LoRA adapter、optimizer、scheduler/RNG 和 dataloader 状态。启动 worker 前会校验 adapter 哈希、基础模型路径和所有续训状态；校验通过后先加载 adapter，再构造 FSDP2/optimizer，因此可精确断点续训。
+
+导出脚本会自动识别完整 FSDP checkpoint 或紧凑 LoRA checkpoint。所有组完成预先约定的固定 step budget 后，合并成 Hugging Face 模型：
 
 ```bash
 cd /absolute/path/to/agentic-grpo-longhorizon/agentic-grpo-longhorizon
@@ -399,7 +423,7 @@ python scripts/test/merge_fsdp_to_hf.py \
 保持已配置的 user simulator 可用（本地方案为 8001），在另一个终端启动待评 policy：
 
 ```bash
-conda activate agentrl
+conda activate agentrl-qwen35
 cd /absolute/path/to/agentic-grpo-longhorizon/agentic-grpo-longhorizon
 
 MODEL_PATH="$PWD/experiments/ablations/111_full/hf_step_300" \

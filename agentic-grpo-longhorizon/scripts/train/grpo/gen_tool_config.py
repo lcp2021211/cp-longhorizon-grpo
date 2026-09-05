@@ -11,6 +11,7 @@ the same schema used during rollout.
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import sys
 from pathlib import Path
 
@@ -30,9 +31,17 @@ def get_tool_schemas(env_name: str = "airline", task_index: int = 0) -> list[dic
 
 
 def build_tool_config(env_name: str, schemas: list[dict]) -> dict:
+    del env_name  # class names are currently shared by the supported domain
     tools = []
     for schema in schemas:
+        schema = deepcopy(schema)
         func = schema.get("function", schema)
+        parameters = func.setdefault(
+            "parameters", {"type": "object", "properties": {}}
+        )
+        # veRL serializes this field explicitly. JSON Schema itself allows it
+        # to be absent when a function has no required arguments.
+        parameters.setdefault("required", [])
         name = func["name"]
         cls_name = f"src.envs.tau_bench_tools.TauBench_{name}_Tool"
         tools.append({

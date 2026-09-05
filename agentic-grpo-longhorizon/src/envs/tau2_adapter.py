@@ -7,6 +7,7 @@ evaluation code.
 """
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 import json
 import os
@@ -100,6 +101,7 @@ class Tau2GymAdapter:
         user_provider: str = "openai",
         user_base_url: Optional[str] = None,
         user_temperature: float = 0.0,
+        user_llm_args: Optional[dict[str, Any]] = None,
     ) -> None:
         self.domain = domain
         self.task_split = task_split
@@ -111,6 +113,7 @@ class Tau2GymAdapter:
         self.user_provider = user_provider
         self.user_base_url = user_base_url
         self.user_temperature = float(user_temperature)
+        self.user_llm_args = deepcopy(user_llm_args or {})
         self._env = None
         self.initial_observation = ""
         self.info: dict[str, Any] = {}
@@ -131,7 +134,8 @@ class Tau2GymAdapter:
                 "with `pip install -e './tau2-bench[gym]'`."
             ) from exc
 
-        user_llm_args: dict[str, Any] = {"temperature": self.user_temperature}
+        user_llm_args: dict[str, Any] = deepcopy(self.user_llm_args)
+        user_llm_args.setdefault("temperature", self.user_temperature)
         if self.user_base_url:
             user_llm_args["api_base"] = self.user_base_url
             user_llm_args["api_key"] = os.environ.get("OPENAI_API_KEY", "EMPTY")

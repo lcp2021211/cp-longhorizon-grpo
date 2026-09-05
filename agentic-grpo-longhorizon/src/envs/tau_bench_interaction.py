@@ -325,6 +325,9 @@ class TauBenchInteraction(BaseInteraction):
         self.task_id_mode: str = config.get("task_id_mode", "id")
         self.max_turns: int = int(config.get("max_turns", 30))
         self.user_temperature: float = float(config.get("user_temperature", 0.0))
+        self.user_llm_args: dict[str, Any] = config.get("user_llm_args", {})
+        if not isinstance(self.user_llm_args, dict):
+            raise TypeError("user_llm_args must be a mapping")
 
         # reward mode switching. `progpo` keeps the scalar reward outcome-only.
         self.reward_mode: str = config.get("reward_mode", "binary")
@@ -369,6 +372,7 @@ class TauBenchInteraction(BaseInteraction):
             user_provider=self.user_provider,
             user_base_url=self.user_base_url,
             user_temperature=self.user_temperature,
+            user_llm_args=self.user_llm_args,
         )
         # tau2 reset may call the LLM user simulator, so keep it off the event loop.
         initial_observation, _ = await asyncio.to_thread(env.reset)

@@ -33,6 +33,11 @@ TRAIN_CONFIG_NAME = "agentic_ablation_tau2"
 COMPONENT_FIELDS = ("salt_enabled", "progpo_enabled", "lata_enabled")
 MANIFEST_FILENAME = "run_manifest.json"
 MANIFEST_SCHEMA = "agentic-ablation-run/v2"
+MODEL_HASH_CACHE_SCHEMA = "agentic-model-content-cache/v1"
+MODEL_HASH_CACHE_FILENAME = "model_content_sha256_v1.json"
+REQUIRED_RUNTIME_MODULES = (
+    ("qwen_vl_utils", "qwen-vl-utils==0.0.14"),
+)
 PINNED_TAU2_COMMIT = "c3398666e6559e3a063da3fc04b5acf7f941464e"
 STATIC_IDENTITY_FIELDS = (
     "schema",
@@ -72,14 +77,40 @@ IMPLEMENTATION_PATHS = (
     ("tau2_context", "project", "src/envs/tau_bench_context.py"),
     ("tau2_interaction", "project", "src/envs/tau_bench_interaction.py"),
     ("tau2_tools", "project", "src/envs/tau_bench_tools.py"),
-    ("salt_trace", "repository", "verl/verl/experimental/agent_loop/salt_trace.py"),
+    (
+        "salt_trace",
+        "repository",
+        "verl_qwen35/verl/experimental/agent_loop/salt_trace.py",
+    ),
     (
         "tool_agent_loop",
         "repository",
-        "verl/verl/experimental/agent_loop/tool_agent_loop.py",
+        "verl_qwen35/verl/experimental/agent_loop/tool_agent_loop.py",
     ),
-    ("core_algos", "repository", "verl/verl/trainer/ppo/core_algos.py"),
-    ("ray_trainer", "repository", "verl/verl/trainer/ppo/ray_trainer.py"),
+    ("core_algos", "repository", "verl_qwen35/verl/trainer/ppo/core_algos.py"),
+    ("ray_trainer", "repository", "verl_qwen35/verl/trainer/ppo/ray_trainer.py"),
+    ("main_ppo", "repository", "verl_qwen35/verl/trainer/main_ppo.py"),
+    ("fsdp_workers", "repository", "verl_qwen35/verl/workers/fsdp_workers.py"),
+    (
+        "qwen35_transformers",
+        "repository",
+        "verl_qwen35/verl/models/transformers/qwen3_5.py",
+    ),
+    (
+        "compact_lora_checkpoint",
+        "repository",
+        "verl_qwen35/verl/utils/checkpoint/lora_checkpoint.py",
+    ),
+    (
+        "checkpoint_manager",
+        "repository",
+        "verl_qwen35/verl/utils/checkpoint/checkpoint_manager.py",
+    ),
+    (
+        "fsdp_checkpoint_manager",
+        "repository",
+        "verl_qwen35/verl/utils/checkpoint/fsdp_checkpoint_manager.py",
+    ),
 )
 TAU2_ENVIRONMENT_KEYS = (
     ("TAU2_USER_MODEL", "user_model"),
@@ -110,6 +141,7 @@ class RunnerPaths:
     train_data_path: Path
     val_data_path: Path
     ablation_root: Path
+    model_hash_cache_path: Path
 
     @classmethod
     def for_project(cls, project_dir: Path) -> "RunnerPaths":
@@ -131,6 +163,12 @@ class RunnerPaths:
             train_data_path=project_dir / "experiments" / "tau2" / "train.parquet",
             val_data_path=project_dir / "experiments" / "tau2" / "val.parquet",
             ablation_root=project_dir / "experiments" / "ablations",
+            model_hash_cache_path=(
+                project_dir
+                / "experiments"
+                / ".identity_cache"
+                / MODEL_HASH_CACHE_FILENAME
+            ),
         )
 
 
@@ -138,6 +176,7 @@ class RunnerPaths:
 class TrainingDefaults:
     total_steps: int
     total_epochs: int
+    rollouts_per_step: int
 
 
 @dataclass(frozen=True)
@@ -220,16 +259,33 @@ def load_and_validate_matrix(path: Path) -> dict[str, dict[str, Any]]:
 
 def load_training_defaults(path: Path) -> TrainingDefaults:
     raw = _load_yaml_mapping(path, "Training config")
+    data = raw.get("data")
+    actor_rollout_ref = raw.get("actor_rollout_ref")
     trainer = raw.get("trainer")
+    if not isinstance(data, dict):
+        raise RunnerError(f"Training config has no data mapping: {path}")
+    if not isinstance(actor_rollout_ref, dict):
+        raise RunnerError(f"Training config has no actor_rollout_ref mapping: {path}")
     if not isinstance(trainer, dict):
         raise RunnerError(f"Training config has no trainer mapping: {path}")
     steps = trainer.get("total_training_steps")
     epochs = trainer.get("total_epochs")
+    train_batch_size = data.get("train_batch_size")
+    rollout = actor_rollout_ref.get("rollout")
+    rollout_n = rollout.get("n") if isinstance(rollout, dict) else None
     if type(steps) is not int or steps <= 0:
         raise RunnerError("trainer.total_training_steps must be a positive integer")
     if type(epochs) is not int or epochs <= 0:
         raise RunnerError("trainer.total_epochs must be a positive integer")
-    return TrainingDefaults(total_steps=steps, total_epochs=epochs)
+    if type(train_batch_size) is not int or train_batch_size <= 0:
+        raise RunnerError("data.train_batch_size must be a positive integer")
+    if type(rollout_n) is not int or rollout_n <= 0:
+        raise RunnerError("actor_rollout_ref.rollout.n must be a positive integer")
+    return TrainingDefaults(
+        total_steps=steps,
+        total_epochs=epochs,
+        rollouts_per_step=train_batch_size * rollout_n,
+    )
 
 
 def sha256_file(path: Path) -> str:
@@ -332,6 +388,137 @@ def build_content_manifest(
     }
 
 
+def _model_content_metadata(root: Path) -> dict[str, Any]:
+    """Collect a fast, content-free fingerprint for a local model tree."""
+    candidates: list[tuple[Path, Path]] = []
+    if root.is_file():
+        candidates.append((Path(root.name), root))
+    elif root.is_dir():
+        for directory, directory_names, filenames in os.walk(root, followlinks=False):
+            directory_names[:] = sorted(
+                name
+                for name in directory_names
+                if name.lower() not in EXCLUDED_TREE_DIRECTORIES
+            )
+            directory_path = Path(directory)
+            for filename in sorted(filenames):
+                path = directory_path / filename
+                relative = path.relative_to(root)
+                if _tree_path_is_excluded(relative) or not path.is_file():
+                    continue
+                candidates.append((relative, path))
+    else:
+        raise RunnerError(f"Content identity root is not a file/directory: {root}")
+
+    files: list[dict[str, Any]] = []
+    for relative, path in sorted(candidates, key=lambda item: item[0].as_posix()):
+        try:
+            stat_result = path.stat()
+            link_target = os.readlink(path) if path.is_symlink() else None
+        except OSError as exc:
+            raise RunnerError(
+                f"Cannot stat model identity input {path}: {exc}"
+            ) from exc
+        files.append(
+            {
+                "path": relative.as_posix(),
+                "size": stat_result.st_size,
+                "mtime_ns": stat_result.st_mtime_ns,
+                "ctime_ns": stat_result.st_ctime_ns,
+                "device": stat_result.st_dev,
+                "inode": stat_result.st_ino,
+                "link_target": link_target,
+            }
+        )
+    return {"file_count": len(files), "files": files}
+
+
+def _empty_model_hash_cache() -> dict[str, Any]:
+    return {"schema": MODEL_HASH_CACHE_SCHEMA, "entries": {}}
+
+
+def _load_model_hash_cache(path: Path) -> dict[str, Any]:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            loaded = json.load(handle)
+    except FileNotFoundError:
+        return _empty_model_hash_cache()
+    except (OSError, json.JSONDecodeError):
+        # A cache is only an optimization. Never trust or block on a corrupt one.
+        return _empty_model_hash_cache()
+    if (
+        not isinstance(loaded, dict)
+        or loaded.get("schema") != MODEL_HASH_CACHE_SCHEMA
+        or not isinstance(loaded.get("entries"), dict)
+    ):
+        return _empty_model_hash_cache()
+    return loaded
+
+
+def _validated_cached_model_identity(
+    cache: Mapping[str, Any], effective_path: str, metadata: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    entries = cache.get("entries")
+    if not isinstance(entries, dict):
+        return None
+    entry = entries.get(effective_path)
+    if not isinstance(entry, dict) or entry.get("metadata") != metadata:
+        return None
+    identity = entry.get("identity")
+    if (
+        not isinstance(identity, dict)
+        or identity.get("effective_path") != effective_path
+    ):
+        return None
+    content = identity.get("local_content")
+    if not isinstance(content, dict) or not isinstance(content.get("files"), list):
+        return None
+
+    metadata_files = metadata.get("files")
+    if not isinstance(metadata_files, list):
+        return None
+    expected_path_sizes = [
+        {"path": item.get("path"), "size": item.get("size")}
+        for item in metadata_files
+        if isinstance(item, dict)
+    ]
+    cached_path_sizes: list[dict[str, Any]] = []
+    for item in content["files"]:
+        if not isinstance(item, dict) or set(item) != {"path", "size", "sha256"}:
+            return None
+        digest = item.get("sha256")
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            return None
+        cached_path_sizes.append({"path": item.get("path"), "size": item.get("size")})
+    if cached_path_sizes != expected_path_sizes:
+        return None
+
+    canonical = json.dumps(
+        content["files"], ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    tree_sha256 = hashlib.sha256(canonical).hexdigest()
+    if (
+        content.get("state") != "present"
+        or content.get("file_count") != len(content["files"])
+        or content.get("tree_sha256") != tree_sha256
+        or identity.get("local_content_sha256") != tree_sha256
+    ):
+        return None
+    return identity
+
+
+def _store_model_hash_cache_entry(
+    cache_path: Path,
+    effective_path: str,
+    metadata: Mapping[str, Any],
+    identity: Mapping[str, Any],
+) -> None:
+    cache = _load_model_hash_cache(cache_path)
+    entries = cache["entries"]
+    entries[effective_path] = {"metadata": metadata, "identity": identity}
+    atomic_write_manifest(cache_path, cache)
+
+
 def normalize_model_reference(value: str, project_dir: Path) -> str:
     """Return the path/identifier that is effectively used from project cwd."""
     expanded = Path(value).expanduser()
@@ -350,6 +537,8 @@ def _model_identity(
     project_dir: Path,
     *,
     file_hash_cache: MutableMapping[str, str] | None = None,
+    persistent_cache_path: Path | None = None,
+    persist_cache: bool = True,
 ) -> dict[str, Any]:
     effective = normalize_model_reference(reference, project_dir)
     path = Path(effective)
@@ -368,17 +557,37 @@ def _model_identity(
         )
     if not (path.is_dir() or path.is_file()):
         raise RunnerError(f"Local model path is not a file/directory: {path}")
-    content = build_content_manifest(path, file_hash_cache=file_hash_cache)
-    if content["file_count"] == 0:
+
+    metadata_before = _model_content_metadata(path)
+    if metadata_before["file_count"] == 0:
         raise RunnerError(
             f"Local model path contains no identity-bearing files: {path}"
         )
-    return {
+    cache_path = persistent_cache_path or (
+        project_dir / "experiments" / ".identity_cache" / MODEL_HASH_CACHE_FILENAME
+    )
+    cached_identity = _validated_cached_model_identity(
+        _load_model_hash_cache(cache_path), effective, metadata_before
+    )
+    if cached_identity is not None:
+        return cached_identity
+
+    content = build_content_manifest(path, file_hash_cache=file_hash_cache)
+    metadata_after = _model_content_metadata(path)
+    if metadata_after != metadata_before:
+        raise RunnerError(
+            f"Local model changed while its content was being hashed: {path}. "
+            "Retry after the model files are stable."
+        )
+    identity = {
         "kind": "local_directory" if path.is_dir() else "local_file",
         "effective_path": effective,
         "local_content": content,
         "local_content_sha256": content["tree_sha256"],
     }
+    if persist_cache:
+        _store_model_hash_cache_entry(cache_path, effective, metadata_after, identity)
+    return identity
 
 
 def build_models_identity(
@@ -387,6 +596,8 @@ def build_models_identity(
     *,
     project_dir: Path,
     model_identity_cache: MutableMapping[str, dict[str, Any]] | None = None,
+    persistent_cache_path: Path | None = None,
+    persist_cache: bool = True,
 ) -> dict[str, Any]:
     """Build actor/ref identity, hashing an identical local model only once."""
     identities = model_identity_cache if model_identity_cache is not None else {}
@@ -399,6 +610,8 @@ def build_models_identity(
                 effective,
                 project_dir,
                 file_hash_cache=file_hash_cache,
+                persistent_cache_path=persistent_cache_path,
+                persist_cache=persist_cache,
             )
         return identities[effective]
 
@@ -419,18 +632,15 @@ def resolve_model_references(
         return effective, effective
     try:
         actor = training_config["actor_rollout_ref"]["model"]["path"]
-        reference = training_config["actor_rollout_ref"]["ref"]["model"]["path"]
     except (KeyError, TypeError) as exc:
         raise RunnerError(
-            "Training config must define actor_rollout_ref.model.path and "
-            "actor_rollout_ref.ref.model.path"
+            "Training config must define actor_rollout_ref.model.path"
         ) from exc
-    if not isinstance(actor, str) or not isinstance(reference, str):
-        raise RunnerError("Actor and reference model paths must be strings")
-    return (
-        normalize_model_reference(actor, project_dir),
-        normalize_model_reference(reference, project_dir),
-    )
+    if not isinstance(actor, str):
+        raise RunnerError("Actor/reference model path must be a string")
+    effective = normalize_model_reference(actor, project_dir)
+    # Modern veRL shares actor_rollout_ref.model between actor and reference.
+    return effective, effective
 
 
 def _nested_config_value(
@@ -792,6 +1002,7 @@ def build_run_identity(
     include_datasets: bool,
     training_config: Mapping[str, Any] | None = None,
     model_identity_cache: MutableMapping[str, dict[str, Any]] | None = None,
+    persist_model_cache: bool = True,
 ) -> dict[str, Any]:
     """Build the immutable identity used to guard checkpoint resumption.
 
@@ -812,6 +1023,8 @@ def build_run_identity(
             reference_model,
             project_dir=paths.project_dir,
             model_identity_cache=model_identity_cache,
+            persistent_cache_path=paths.model_hash_cache_path,
+            persist_cache=persist_model_cache,
         ),
         "training_config": {
             "effective_path": str(paths.train_config_path.resolve(strict=False)),
@@ -848,6 +1061,7 @@ def build_current_plan_identity(
     model_override: str | None,
     include_datasets: bool,
     model_identity_cache: MutableMapping[str, dict[str, Any]] | None = None,
+    persist_model_cache: bool = True,
 ) -> tuple[dict[str, Any], str, str]:
     """Reload config and construct identity from the state that exists now."""
     training_config = _load_yaml_mapping(paths.train_config_path, "Training config")
@@ -866,6 +1080,7 @@ def build_current_plan_identity(
             include_datasets=include_datasets,
             training_config=training_config,
             model_identity_cache=model_identity_cache,
+            persist_model_cache=persist_model_cache,
         ),
         actor_model,
         reference_model,
@@ -1162,16 +1377,14 @@ def build_training_command(
         f"trainer.resume_mode={resume_mode}",
         f"trainer.default_local_dir={plan.checkpoint_dir}",
         f"trainer.experiment_name={plan.experiment_id}",
+        # Keep console output while also recording the trainer's existing
+        # per-step metrics locally. This changes only the logging backends.
+        "trainer.logger=[console,tensorboard]",
         f"hydra.run.dir={run_dir / 'hydra'}/${{now:%Y%m%d_%H%M%S}}",
         "hydra.job.chdir=false",
     ]
     if model_path is not None:
-        command.extend(
-            [
-                f"actor_rollout_ref.model.path={model_path}",
-                f"actor_rollout_ref.ref.model.path={model_path}",
-            ]
-        )
+        command.append(f"actor_rollout_ref.model.path={model_path}")
     return command
 
 
@@ -1179,10 +1392,42 @@ def format_command(command: Sequence[str]) -> str:
     return shlex.join(str(part) for part in command)
 
 
+def build_rollout_monitor_command(
+    paths: RunnerPaths,
+    *,
+    python_executable: str,
+    log_path: Path,
+    tensorboard_dir: Path,
+    rollouts_per_step: int,
+) -> list[str]:
+    return [
+        python_executable,
+        str(
+            paths.project_dir
+            / "scripts"
+            / "train"
+            / "grpo"
+            / "log_to_tensorboard.py"
+        ),
+        "--log-file",
+        str(log_path),
+        "--tensorboard-dir",
+        str(tensorboard_dir),
+        "--rollouts-per-step",
+        str(rollouts_per_step),
+    ]
+
+
 def run_streaming_command(
-    command: Sequence[str], *, cwd: Path, log_path: Path, output: TextIO = sys.stdout
+    command: Sequence[str],
+    *,
+    cwd: Path,
+    log_path: Path,
+    output: TextIO = sys.stdout,
+    env: Mapping[str, str] | None = None,
+    monitor_command: Sequence[str] | None = None,
 ) -> int:
-    """Tee combined stdout/stderr to console and a file, preserving exit code."""
+    """Tee output and reap the optional read-only log monitor with the child."""
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a", encoding="utf-8", buffering=1) as log_handle:
         header = f"\n$ {format_command(command)}\n"
@@ -1193,6 +1438,7 @@ def run_streaming_command(
             process = subprocess.Popen(
                 list(command),
                 cwd=cwd,
+                env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -1207,6 +1453,23 @@ def run_streaming_command(
             log_handle.write(message)
             return 127
 
+        monitor_process: subprocess.Popen[str] | None = None
+        if monitor_command is not None:
+            try:
+                monitor_process = subprocess.Popen(
+                    list(monitor_command),
+                    cwd=cwd,
+                    env=env,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                )
+            except OSError as exc:
+                message = f"Warning: failed to start rollout monitor: {exc}\n"
+                output.write(message)
+                output.flush()
+                log_handle.write(message)
+
         assert process.stdout is not None
         try:
             with process.stdout:
@@ -1218,6 +1481,14 @@ def run_streaming_command(
             process.terminate()
             process.wait()
             raise
+        finally:
+            if monitor_process is not None and monitor_process.poll() is None:
+                monitor_process.terminate()
+                try:
+                    monitor_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    monitor_process.kill()
+                    monitor_process.wait()
         return process.wait()
 
 
@@ -1228,6 +1499,22 @@ def run_simple_command(command: Sequence[str], *, cwd: Path) -> int:
         raise RunnerError(
             f"Failed to start command: {format_command(command)}: {exc}"
         ) from exc
+
+
+def validate_runtime_dependencies() -> None:
+    """Fail before model loading when an agent-loop runtime module is absent."""
+    missing = [
+        requirement
+        for module, requirement in REQUIRED_RUNTIME_MODULES
+        if importlib.util.find_spec(module) is None
+    ]
+    if missing:
+        requirements = " ".join(missing)
+        raise RunnerError(
+            "Missing training runtime dependencies: "
+            f"{requirements}. Install them in the active environment with "
+            f"`python -m pip install {requirements}`."
+        )
 
 
 def _positive_int(value: str) -> int:
@@ -1362,6 +1649,8 @@ def execute(
         print_matrix(matrix, output)
         return 0
 
+    validate_runtime_dependencies()
+
     defaults = load_training_defaults(paths.train_config_path)
     target_steps = args.steps or defaults.total_steps
     selected = parse_experiment_selection(args.experiments, matrix)
@@ -1413,6 +1702,7 @@ def execute(
                 model_override=args.model_path,
                 include_datasets=datasets_available,
                 model_identity_cache=shared_model_identity_cache,
+                persist_model_cache=not args.dry_run,
             )
             identity_status = validate_or_create_manifest(
                 plan,
@@ -1470,10 +1760,11 @@ def execute(
         output.write(f"[train] {plan.experiment_id}: {plan.reason}; log={log_path}\n")
         output.flush()
         try:
-            # This deliberately bypasses the planning cache and re-hashes all
-            # identity-bearing inputs at the last possible point before Popen.
-            # It closes the plan/launch window for model, config, code, tau2,
-            # dataset, and simulator-routing changes.
+            # Rebuild identity at the last possible point before Popen. Local
+            # models use the persistent content hash only when their complete
+            # metadata fingerprint is unchanged, so this is a fast pre-launch
+            # check without rereading weight bytes. Other, small identity inputs
+            # are re-hashed to close the plan/launch drift window.
             launch_identity, _, _ = build_current_plan_identity(
                 paths,
                 plan,
@@ -1499,8 +1790,35 @@ def execute(
             if not args.continue_on_error:
                 return 1
             continue
+        tensorboard_dir = (
+            paths.ablation_root / plan.experiment_id / "tensorboard"
+        ).resolve()
+        training_env = os.environ.copy()
+        training_env["TENSORBOARD_DIR"] = str(tensorboard_dir)
+        output.write(
+            f"[tensorboard] {plan.experiment_id}: logdir={tensorboard_dir}\n"
+            f"[tensorboard] view with: tensorboard --logdir {shlex.quote(str(tensorboard_dir))} "
+            "--host 127.0.0.1 --port 6006\n"
+        )
+        monitor_command = build_rollout_monitor_command(
+            paths,
+            python_executable=python_executable,
+            log_path=log_path,
+            tensorboard_dir=tensorboard_dir,
+            rollouts_per_step=defaults.rollouts_per_step,
+        )
+        output.write(
+            f"[rollout-monitor] {plan.experiment_id}: "
+            f"{defaults.rollouts_per_step} rollouts/step; tags=rollout_live/*\n"
+        )
+        output.flush()
         return_code = run_streaming_command(
-            command, cwd=paths.project_dir, log_path=log_path, output=output
+            command,
+            cwd=paths.project_dir,
+            log_path=log_path,
+            output=output,
+            env=training_env,
+            monitor_command=monitor_command,
         )
         if return_code != 0:
             failures += 1
